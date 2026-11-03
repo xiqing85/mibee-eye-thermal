@@ -6,11 +6,16 @@ mibee-eye-thermal 的传感器接入按三层解耦设计：**总线传输**（�
 
 ```sh
 # 发现所有可达的 MLX90640（硬件总线 × 0x30..0x3E + GPIO 候选对）
-mibee-eye-thermal scan [--gpio-candidates 226,227:8,10]
+sudo mibee-eye-thermal scan [--gpio-candidates 226,227:8,10]
 ```
 
-`scan` 是只读探测（每个组合只读一个 EE ID 字），对总线上其它芯片（PMIC、HDMI
-DDC、PHY）无副作用；输出每条命中的 `bus` + `addr` + 即贴即用的配置段：
+> `sudo`：GPIO 候选对的 sysfs export 与 TWI 控制器 unbind 都是 root-only 写。
+> 非 root 运行时 scan 会明确报告 `Permission denied … run scan with sudo`，
+> 而**不会**静默漏报。对器件本身 scan 保持只读（每个组合只读一个 EE ID
+> 字），对总线上其它芯片（PMIC、HDMI DDC、PHY）无副作用；探 GPIO 候选对
+> 前会先做与 `serve` 相同的引脚释放（unbind TWI2 + 清 stale export）。
+
+输出每条命中的 `bus` + `addr` + 即贴即用的配置段：
 
 ```
 found MLX90640: bus=gpio:226,227 addr=0x33 id=0x1901

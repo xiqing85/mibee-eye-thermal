@@ -199,7 +199,11 @@ fn run() -> Result<()> {
             let mut hits = scan::scan_twi();
             println!("scanning GPIO bit-bang candidates {:?}...", gpio_candidates);
             for (sda, scl) in &gpio_candidates {
-                hits.extend(scan::scan_gpio_pair(*sda, *scl));
+                let (found, pair_err) = scan::scan_gpio_pair(*sda, *scl);
+                if let Some(e) = pair_err {
+                    println!("  pair unusable — {e}");
+                }
+                hits.extend(found);
             }
             if hits.is_empty() {
                 println!("no MLX90640 found — check wiring/VCC and see docs/porting.md");

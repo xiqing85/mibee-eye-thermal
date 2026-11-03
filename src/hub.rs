@@ -165,19 +165,6 @@ impl FrameSource for ThermalHub {
     }
 }
 
-/// Release the TWI2 driver + stale sysfs exports so bit-bang can own PH2/PH3
-/// (same dance as the bring-up viewer; idempotent, best-effort).
-fn release_i2c_pins(sda: u32, scl: u32) {
-    let _ = std::fs::write(
-        "/sys/bus/platform/drivers/mv64xxx_i2c/unbind",
-        "5002800.i2c",
-    );
-    for n in [sda, scl] {
-        let _ = std::fs::write("/sys/class/gpio/unexport", n.to_string());
-    }
-    std::thread::sleep(Duration::from_millis(300));
-}
-
 enum AnyBus {
     Twi(Twi),
     Gpio(BitBang),
@@ -209,7 +196,7 @@ fn open_bus(spec: &BusSpec, addr: u8) -> crate::Result<AnyBus> {
     match spec {
         BusSpec::Twi(dev) => Ok(AnyBus::Twi(Twi::open(dev, addr)?)),
         BusSpec::Gpio { sda, scl } => {
-            release_i2c_pins(*sda, *scl);
+            crate::scan::release_gpio_pair(*sda, *scl);
             Ok(AnyBus::Gpio(BitBang::new(*sda, *scl, addr)?))
         }
         BusSpec::Auto => {
@@ -234,7 +221,7 @@ fn open_bus(spec: &BusSpec, addr: u8) -> crate::Result<AnyBus> {
                             crate::error::Error::Bus("auto-detect returned bad pin".into())
                         })?,
                     );
-                    release_i2c_pins(sda, scl);
+                    crate::scan::release_gpio_pair(sda, scl);
                     Ok(AnyBus::Gpio(BitBang::new(sda, scl, hit.addr)?))
                 }
                 None => Err(crate::error::Error::Bus(

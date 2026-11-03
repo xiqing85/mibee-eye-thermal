@@ -11,8 +11,8 @@
 //! so scanning a bus with unrelated I2C chips (PMIC, HDMI DDC, PHY) is
 //! safe — they either NAK or return an implausible ID.
 
-use crate::i2c::{bitbang::BitBang, twi::Twi};
-use crate::mlx90640::Mlx90640;
+use crate::i2c::{bitbang::BitBang, twi::Twi, MlxBus};
+use crate::mlx90640::{Mlx90640, REG_ID};
 use crate::Result;
 
 /// MLX90640 plausible-address window (datasheet: 7-bit SA 0x30..=0x3E with
@@ -72,15 +72,57 @@ pub fn scan_twi() -> Vec<Hit> {
     twi_devices().iter().flat_map(|d| scan_twi_dev(d)).collect()
 }
 
+/// Release the board's TWI controller + stale sysfs exports so bit-bang can
+/// own the candidate pins (same dance as the `serve` path; idempotent,
+/// best-effort). `5002800.i2c` is the Orange Pi Zero 3 TWI2 on PH2/PH3 —
+/// other boards: see docs/porting.md.
+pub(crate) fn release_gpio_pair(sda: u32, scl: u32) {
+    let _ = std::fs::write(
+        "/sys/bus/platform/drivers/mv64xxx_i2c/unbind",
+        "5002800.i2c",
+    );
+    for n in [sda, scl] {
+        let _ = std::fs::write("/sys/class/gpio/unexport", n.to_string());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+/// Operator hint appended to a failed GPIO-pair probe — the common cases
+/// (permissions, busy pins) have one-line fixes and must not be silent.
+fn pair_error_hint(e: &crate::error::Error) -> String {
+    let s = e.to_string();
+    if s.contains("Permission denied") {
+        " (sysfs GPIO export needs root — run scan with sudo)".into()
+    } else if s.contains("Device or resource busy") {
+        " (pins held by another process — stop mibee-eye-thermal first)".into()
+    } else {
+        String::new()
+    }
+}
+
 /// Probe one sysfs GPIO pair (SDA, SCL) × address range via bit-bang.
-pub fn scan_gpio_pair(sda: u32, scl: u32) -> Vec<Hit> {
+///
+/// Returns the hits plus a failure reason when the *pair itself* was
+/// unusable (export denied, lines stuck) — distinct from "probed clean,
+/// nothing answered", which is not an error. Reuses the serve bring-up
+/// dance: the board's TWI controller must let go of the pins before sysfs
+/// GPIO reaches the pads, and the pair is exported once for the whole
+/// address walk (`BitBang::set_addr`) instead of per address.
+pub fn scan_gpio_pair(sda: u32, scl: u32) -> (Vec<Hit>, Option<String>) {
     let mut hits = Vec::new();
+    release_gpio_pair(sda, scl);
+    let mut bus = match BitBang::new(sda, scl, *ADDR_RANGE.start()) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                hits,
+                Some(format!("gpio {sda},{scl}: {e}{}", pair_error_hint(&e))),
+            )
+        }
+    };
     for addr in ADDR_RANGE.clone() {
-        let Ok(bus) = BitBang::new(sda, scl, addr) else {
-            return hits; // pair unusable (stuck lines) — no point per-address
-        };
-        let mut s = Mlx90640::new(bus);
-        if let Ok(id) = s.read_id() {
+        bus.set_addr(addr);
+        if let Ok(id) = bus.read_reg16(REG_ID) {
             if plausible_id(id) {
                 hits.push(Hit {
                     bus: format!("gpio:{sda},{scl}"),
@@ -90,7 +132,7 @@ pub fn scan_gpio_pair(sda: u32, scl: u32) -> Vec<Hit> {
             }
         }
     }
-    hits
+    (hits, None)
 }
 
 /// `--gpio-candidates 226,227:8,10` → [(226,227), (8,10)] with the module
@@ -127,7 +169,7 @@ pub fn auto_detect() -> Option<(Hit, bool)> {
     if let Some(h) = twi.first() {
         return Some((h.clone(), false));
     }
-    let gpio = scan_gpio_pair(226, 227);
+    let (gpio, _pair_err) = scan_gpio_pair(226, 227);
     gpio.first().map(|h| (h.clone(), true))
 }
 
@@ -188,5 +230,17 @@ mod tests {
         assert!(ADDR_RANGE.contains(&0x30));
         assert!(ADDR_RANGE.contains(&0x3E));
         assert!(!ADDR_RANGE.contains(&0x3F));
+    }
+
+    #[test]
+    fn pair_error_hint_covers_common_cases() {
+        // EACCES: sysfs GPIO export is root-only — say so.
+        let e = crate::error::Error::Io(std::io::Error::from_raw_os_error(13));
+        assert!(pair_error_hint(&e).contains("sudo"));
+        // EBUSY: another process holds the exported pins.
+        let e = crate::error::Error::Io(std::io::Error::from_raw_os_error(16));
+        assert!(pair_error_hint(&e).contains("stop"));
+        // Anything else: no invented hint.
+        assert_eq!(pair_error_hint(&crate::error::Error::Bus("NAK".into())), "");
     }
 }
