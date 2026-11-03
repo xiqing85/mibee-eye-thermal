@@ -1,0 +1,16 @@
+[package]
+name = "mibee-eye-thermal"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.83"
+description = "MiBee Eye thermal imaging camera — MLX90640 (32x24 IR array) to GB28181/RTSP/Web"
+license = "Apache-2.0"
+repository = "https://github.com/xiqing85/mibee-eye-thermal"
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true

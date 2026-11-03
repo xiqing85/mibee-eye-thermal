@@ -1,0 +1,9 @@
+mibee-eye-thermal
+Copyright 2026 The mibee-eye authors
+
+This product includes software developed as part of the MiBee Eye project
+(https://github.com/xiqing85).
+
+MLX90640 register map and frame-extraction maths are implemented from the
+public Melexis MLX90640 dataset/datasheet descriptions; no Melexis SDK code
+is included.
