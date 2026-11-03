@@ -20,7 +20,7 @@ const IRONBOW: [(f32, u8, u8, u8); 8] = [
     (1.00, 255, 255, 224),
 ];
 
-fn ironbow(t: f32) -> (u8, u8, u8) {
+pub fn ironbow(t: f32) -> (u8, u8, u8) {
     let t = t.clamp(0.0, 1.0);
     for w in IRONBOW.windows(2) {
         let (t0, r0, g0, b0) = w[0];
@@ -53,8 +53,18 @@ pub fn render_rgb_annotated(
     lo: Option<f32>,
     hi: Option<f32>,
 ) -> Vec<u8> {
+    // The renderer's stretch and the overlay's color bar must agree.
+    let mut sorted = *to;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lo_idx = ((PIXELS as f32 * P_LO) as usize).min(PIXELS - 1);
+    let hi_idx = ((PIXELS as f32 * P_HI) as usize).min(PIXELS - 1);
+    let (sorted_lo, sorted_hi) = (sorted[lo_idx], sorted[hi_idx]);
+    let range = match (lo, hi) {
+        (Some(lo), Some(hi)) if hi - lo > 1e-3 => (lo, hi),
+        _ => (sorted_lo, sorted_hi),
+    };
     let mut rgb = render_rgb_range(to, out_w, out_h, lo, hi);
-    overlay_temperatures(to, &mut rgb, out_w, out_h);
+    overlay_temperatures(to, &mut rgb, out_w, out_h, range);
     rgb
 }
 
@@ -190,7 +200,8 @@ pub fn rgb_to_bmp(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
 }
 
 /// Minimal 5x7 bitmap font for on-image temperature labels (digits, decimal
-/// point, minus, C, degree ring) — no font dependency, rows are 5-bit masks.
+/// point, minus, C, degree ring). Rendered with 3x supersampling then box
+/// filtering — anti-aliased edges, crisp look, zero font dependencies.
 const FONT: [(char, [u8; 7]); 14] = [
     ('0', [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E]),
     ('1', [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E]),
@@ -212,77 +223,175 @@ fn glyph(ch: char) -> Option<[u8; 7]> {
     FONT.iter().find(|(c, _)| *c == ch).map(|(_, rows)| *rows)
 }
 
-/// Draw `text` into an RGB buffer at (x, y) with integer `scale`, on a
-/// solid dark box for contrast. Returns the box extent.
-fn draw_text(rgb: &mut [u8], w: usize, h: usize, x: usize, y: usize, text: &str, scale: usize) {
+/// Blend one RGB pixel toward `color` by coverage (0..=255).
+fn blend_px(rgb: &mut [u8], p: usize, color: (u8, u8, u8), coverage: u8) {
+    let a = f32::from(coverage) / 255.0;
+    for (c, chan) in [color.0, color.1, color.2].into_iter().enumerate() {
+        let cur = f32::from(rgb[p + c]);
+        rgb[p + c] = (cur + (f32::from(chan) - cur) * a)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Text metrics in destination pixels for a scale factor (tight degree-ring
+/// advance accounted).
+struct TextBox {
+    w: usize,
+    h: usize,
+    pad: usize,
+}
+
+fn text_advance(text: &[char], scale: usize) -> usize {
+    text.iter()
+        .map(|&c| if c == '\u{00b0}' { 4 } else { 6 })
+        .sum::<usize>()
+        * scale
+}
+
+fn text_box(text: &[char], scale: usize) -> TextBox {
+    let pad = 2 * scale;
+    TextBox {
+        w: text_advance(text, scale) + pad * 2,
+        h: 7 * scale + pad * 2,
+        pad,
+    }
+}
+
+/// Anti-aliased text on a rounded translucent dark box blended over the
+/// image (65% darkening — readable on any background without a solid slab).
+#[allow(clippy::too_many_arguments)]
+fn draw_text_aa(
+    rgb: &mut [u8],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    text: &str,
+    scale: usize,
+    color: (u8, u8, u8),
+) {
     let chars: Vec<char> = text.chars().collect();
-    let box_w = chars.len() * 6 * scale + 2 * scale;
-    let box_h = 7 * scale + 2 * scale;
-    // Clamp the label box inside the image with a small margin.
-    const MARGIN: usize = 4;
-    let x = x.min(w.saturating_sub(box_w + MARGIN));
-    let y = y.min(h.saturating_sub(box_h + MARGIN));
-    for dy in 0..box_h {
-        for dx in 0..box_w {
+    let b = text_box(&chars, scale);
+    const MARGIN: usize = 6;
+    let x = x.min(w.saturating_sub(b.w + MARGIN));
+    let y = y.min(h.saturating_sub(b.h + MARGIN));
+    if b.w == 0 || b.h == 0 || x >= w || y >= h {
+        return;
+    }
+
+    // Rounded translucent background.
+    let radius = 2 * scale;
+    for dy in 0..b.h.min(h - y) {
+        for dx in 0..b.w.min(w - x) {
+            let nx = dx.min(b.w - dx).min(radius);
+            let ny = dy.min(b.h - dy).min(radius);
+            if nx + ny < radius {
+                continue; // outside the rounded corner
+            }
             let p = ((y + dy) * w + (x + dx)) * 3;
-            rgb[p] = 12;
-            rgb[p + 1] = 12;
-            rgb[p + 2] = 16;
+            for c in 0..3 {
+                rgb[p + c] = (f32::from(rgb[p + c]) * 0.35) as u8;
+            }
         }
     }
+
+    // Glyph pass with 3x3 supersampling per destination pixel.
+    const SS: usize = 3;
     for (ci, &ch) in chars.iter().enumerate() {
         let Some(rows) = glyph(ch) else { continue };
-        for (ry, row) in rows.iter().enumerate() {
-            for rx in 0..5 {
-                if row & (1 << (4 - rx)) == 0 {
-                    continue;
-                }
-                for sy in 0..scale {
-                    for sx in 0..scale {
-                        let px = x + scale + (ci * 6 + rx) * scale + sx;
-                        let py = y + scale + (ry * scale) + sy;
-                        if px >= w || py >= h {
-                            continue;
+        // Tight advance after the degree ring keeps "36.7\u{00b0}C" compact.
+        let origin = chars[..ci]
+            .iter()
+            .map(|&c| if c == '\u{00b0}' { 4 } else { 6 })
+            .sum::<usize>()
+            * scale;
+        for gy in 0..7 * scale {
+            for gx in 0..5 * scale {
+                let mut hits = 0usize;
+                for sy in 0..SS {
+                    for sx in 0..SS {
+                        let fx =
+                            ((gx as f32 + sx as f32 / SS as f32) / scale as f32).floor() as i32;
+                        let fy =
+                            ((gy as f32 + sy as f32 / SS as f32) / scale as f32).floor() as i32;
+                        if (0..5).contains(&fx)
+                            && (0..7).contains(&fy)
+                            && rows[fy as usize] & (1 << (4 - fx)) != 0
+                        {
+                            hits += 1;
                         }
-                        let p = (py * w + px) * 3;
-                        rgb[p] = 255;
-                        rgb[p + 1] = 255;
-                        rgb[p + 2] = 255;
                     }
                 }
+                if hits == 0 {
+                    continue;
+                }
+                let coverage = (hits * 255 / (SS * SS)) as u8;
+                let px = x + b.pad + origin + gx;
+                let py = y + b.pad + gy;
+                if px >= w || py >= h {
+                    continue;
+                }
+                blend_px(rgb, (py * w + px) * 3, color, coverage);
             }
         }
     }
 }
 
-fn crosshair(rgb: &mut [u8], w: usize, h: usize, cx: usize, cy: usize, r: usize, cr: (u8, u8, u8)) {
-    // 1px dark outline first so the marker survives bright (white-hot)
-    // backgrounds, then the color core on top.
-    for pass in [((0u8, 0u8, 0u8), 1i32), (cr, 0)] {
-        for d in -(r as i32)..=(r as i32) {
-            for o in [-pass.1, pass.1] {
+/// FLIR-style thin L-corner brackets centered on a spot (side `s` px):
+/// 1px color core with a 1px dark outline, short corner arms — instrument
+/// look, subtle on any background.
+fn brackets(
+    rgb: &mut [u8],
+    w: usize,
+    h: usize,
+    cx: usize,
+    cy: usize,
+    s: usize,
+    color: (u8, u8, u8),
+) {
+    let half = (s / 2) as i32;
+    let arm = (half + 1).min(6);
+    let (ccx, ccy) = (cx as i32, cy as i32);
+    for (col, off) in [((0, 0, 0), 1i32), (color, 0)] {
+        // Four corners: (±half, ±half), arms of length `arm` inward.
+        for (sx, sy) in [(-1, -1), (1, -1), (-1, 1), (1, 1)] {
+            for d in 0..arm {
                 for (px, py) in [
-                    (cx as i32 + d + o, cy as i32),
-                    (cx as i32, cy as i32 + d + o),
+                    (
+                        ccx + sx * (half + off) - sx * off,
+                        ccy + sy * (half + off) + sy * d - sy * off,
+                    ),
+                    (
+                        ccx + sx * (half + off) + sx * d - sx * off,
+                        ccy + sy * (half + off) - sy * off,
+                    ),
                 ] {
                     if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
                         continue;
                     }
                     let p = (py as usize * w + px as usize) * 3;
-                    rgb[p] = pass.0 .0;
-                    rgb[p + 1] = pass.0 .1;
-                    rgb[p + 2] = pass.0 .2;
+                    rgb[p] = col.0;
+                    rgb[p + 1] = col.1;
+                    rgb[p + 2] = col.2;
                 }
             }
         }
     }
 }
 
-/// Bake thermal-camera-style overlays onto a rendered frame: max/min
-/// crosshairs with value labels and a center-spot reading. This is the
-/// one path every consumer sees (webui card, /viewer, snapshot, GB28181
-/// stream recordings).
-pub fn overlay_temperatures(to: &[f32; PIXELS], rgb: &mut [u8], w: usize, h: usize) {
+/// Bake thermal-camera-style overlays onto a rendered frame: max/min/center
+/// thin brackets with value labels (unified below-center anchor) and a
+/// right-side ironbow color bar with range labels — the instrument look
+/// shared by every consumer (webui card, viewer, snapshot, GB28181 stream).
+#[allow(clippy::too_many_arguments)]
+pub fn overlay_temperatures(
+    to: &[f32; PIXELS],
+    rgb: &mut [u8],
+    w: usize,
+    h: usize,
+    range: (f32, f32),
+) {
     let scale = if w >= 480 { 2 } else { 1 };
     let cell_w = w / WIDTH;
     let cell_h = h / HEIGHT;
@@ -296,66 +405,106 @@ pub fn overlay_temperatures(to: &[f32; PIXELS], rgb: &mut [u8], w: usize, h: usi
             min_i = i;
         }
     }
-    let label = |v: f32| -> String {
-        // One decimal, degree ring, C — e.g. "40.9\u{00b0}C".
-        format!("{v:.1}\u{00b0}C")
+    let label = |v: f32| -> String { format!("{v:.1}\u{00b0}C") };
+
+    // Unified anchor rule: bracket centered on the cell, label directly
+    // below the bracket, horizontally centered on it; flip above when the
+    // label would run off the bottom.
+    let mark = |rgb: &mut [u8], i: usize, color: (u8, u8, u8)| {
+        let (gx, gy) = (i % WIDTH, i / WIDTH);
+        let cx = gx * cell_w + cell_w / 2;
+        let cy = gy * cell_h + cell_h / 2;
+        brackets(rgb, w, h, cx, cy, (cell_w * 3 / 2).max(6), color);
+        let chars: Vec<char> = label(to[i]).chars().collect();
+        let b = text_box(&chars, scale);
+        let lx = cx.saturating_sub(b.w / 2);
+        let below = cy + cell_h;
+        let ly = if below + b.h + 4 <= h {
+            below
+        } else {
+            cy.saturating_sub(cell_h + b.h)
+        };
+        draw_text_aa(rgb, w, h, lx, ly, &label(to[i]), scale, color);
     };
 
-    // Max: white crosshair + label above-right.
-    let (mx, my) = (max_i % WIDTH, max_i / WIDTH);
-    crosshair(
-        rgb,
-        w,
-        h,
-        (mx + 1) * cell_w - cell_w / 2,
-        (my + 1) * cell_h - cell_h / 2,
-        (cell_w + cell_h) / 3,
-        (255, 255, 255),
-    );
-    draw_text(
-        rgb,
-        w,
-        h,
-        (mx + 1) * cell_w + cell_w / 2,
-        ((my + 1) * cell_h).saturating_sub(11 * scale) - cell_h / 2,
-        &label(to[max_i]),
-        scale,
-    );
+    // Label text stays high-contrast white on every marker; the bracket
+    // color carries the semantic (vision QA: colored text reads weaker).
+    const WHITE: (u8, u8, u8) = (255, 255, 255);
+    mark(rgb, max_i, (255, 255, 255));
+    mark(rgb, min_i, (110, 235, 255));
 
-    // Min: cyan crosshair + label below-left.
-    let (nx, ny) = (min_i % WIDTH, min_i / WIDTH);
-    crosshair(
-        rgb,
-        w,
-        h,
-        (nx + 1) * cell_w - cell_w / 2,
-        (ny + 1) * cell_h - cell_h / 2,
-        (cell_w + cell_h) / 3,
-        (124, 246, 255),
-    );
-    draw_text(
-        rgb,
-        w,
-        h,
-        ((nx + 1) * cell_w).saturating_sub(18 * scale),
-        (ny + 1) * cell_h + cell_h / 2,
-        &label(to[min_i]),
-        scale,
-    );
-
-    // Center spot: small ring + reading below.
+    // Center spot: tight amber brackets + reading.
     let c_i = (HEIGHT / 2) * WIDTH + WIDTH / 2;
     let (cx, cy) = (w / 2, h / 2);
-    crosshair(rgb, w, h, cx, cy, cell_w / 2, (255, 220, 90));
-    draw_text(
+    brackets(rgb, w, h, cx, cy, cell_w.max(6), (255, 214, 92));
+    let cchars: Vec<char> = label(to[c_i]).chars().collect();
+    let cb = text_box(&cchars, scale);
+    draw_text_aa(
         rgb,
         w,
         h,
-        cx.saturating_sub(9 * scale),
-        cy + cell_h / 2,
+        cx.saturating_sub(cb.w / 2),
+        (cy + cell_h).min(h.saturating_sub(cb.h + 6)),
         &label(to[c_i]),
         scale,
+        WHITE,
     );
+
+    // Right-side color bar: ironbow vertical strip with top/mid/bottom range
+    // labels — the "real instrument" anchor.
+    let bar_w = (scale * 8).max(12);
+    let bar_h = h * 2 / 3;
+    let bx = w.saturating_sub(bar_w + 10);
+    let by = (h - bar_h) / 2;
+    for dy in 0..bar_h {
+        let t = 1.0 - dy as f32 / bar_h as f32; // top = hot
+        let (r, g, bl) = crate::render::ironbow(t);
+        for dx in 0..bar_w {
+            let px = bx + dx;
+            let py = by + dy;
+            if px >= w || py >= h {
+                continue;
+            }
+            let p = (py * w + px) * 3;
+            rgb[p] = r;
+            rgb[p + 1] = g;
+            rgb[p + 2] = bl;
+        }
+    }
+    // Thin outline around the bar.
+    for (col, off) in [((0, 0, 0), 1i32), ((255, 255, 255), 0)] {
+        for d in 0..=bar_h {
+            for px in [bx as i32 - off, (bx + bar_w) as i32 + off - 1] {
+                let py = by as i32 + d as i32 - off;
+                if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+                    continue;
+                }
+                let p = (py as usize * w + px as usize) * 3;
+                rgb[p] = col.0;
+                rgb[p + 1] = col.1;
+                rgb[p + 2] = col.2;
+            }
+        }
+    }
+    let (lo, hi) = range;
+    let mid = (lo + hi) / 2.0;
+    let ranges = [(hi, by), (mid, by + bar_h / 2), (lo, by + bar_h)];
+    for (v, ty) in ranges {
+        let text = format!("{v:.1}\u{00b0}");
+        let chars: Vec<char> = text.chars().collect();
+        let b = text_box(&chars, scale);
+        // Labels hug the bar's left side, vertically centered on the tick.
+        draw_text_aa(
+            rgb,
+            w,
+            h,
+            bx.saturating_sub(b.w + 6),
+            ty.saturating_sub(b.h / 2),
+            &text,
+            scale,
+            (255, 255, 255),
+        );
+    }
 }
 
 #[cfg(test)]
