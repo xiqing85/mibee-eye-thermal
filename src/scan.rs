@@ -1,0 +1,192 @@
+//! Hardware adaptation: bus/pin/address discovery for MLX90640 modules.
+//!
+//! Different carrier boards expose different I2C buses, GPIO base numbers
+//! and module strapping (MLX90640 responds at 0x33 by factory default, but
+//! A1/A0 strapping moves it across 0x30..=0x3E). Instead of guessing, the
+//! `scan` command walks every hardware bus × plausible address and every
+//! candidate GPIO pair, identifies the sensor by its EEPROM ID word, and
+//! prints the working configuration.
+//!
+//! Read-only (a single word read per probe); never writes to any device,
+//! so scanning a bus with unrelated I2C chips (PMIC, HDMI DDC, PHY) is
+//! safe — they either NAK or return an implausible ID.
+
+use crate::i2c::{bitbang::BitBang, twi::Twi};
+use crate::mlx90640::Mlx90640;
+use crate::Result;
+
+/// MLX90640 plausible-address window (datasheet: 7-bit SA 0x30..=0x3E with
+/// A1/A0 straps; 0x33 is the factory default).
+pub const ADDR_RANGE: std::ops::RangeInclusive<u8> = 0x30..=0x3E;
+
+/// One discovered sensor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hit {
+    /// Human-readable transport description (config `bus` value shape).
+    pub bus: String,
+    pub addr: u8,
+    pub id: u16,
+}
+
+fn plausible_id(id: u16) -> bool {
+    // The ID word is a real calibration value: never 0x0000/0xFFFF and the
+    // low nibble pattern varies. Anything read back cleanly counts.
+    id != 0x0000 && id != 0xFFFF
+}
+
+/// Enumerate /dev/i2c-* devices present on this board.
+pub fn twi_devices() -> Vec<String> {
+    let mut out = Vec::new();
+    for n in 0..16 {
+        let p = format!("/dev/i2c-{n}");
+        if std::path::Path::new(&p).exists() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Probe one hardware TWI device × address range.
+pub fn scan_twi_dev(dev: &str) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    for addr in ADDR_RANGE.clone() {
+        let Ok(bus) = Twi::open(dev, addr) else {
+            continue; // bus open failed once — skip its whole range below
+        };
+        let mut s = Mlx90640::new(bus);
+        if let Ok(id) = s.read_id() {
+            if plausible_id(id) {
+                hits.push(Hit {
+                    bus: format!("twi:{dev}"),
+                    addr,
+                    id,
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// Probe every hardware TWI bus.
+pub fn scan_twi() -> Vec<Hit> {
+    twi_devices().iter().flat_map(|d| scan_twi_dev(d)).collect()
+}
+
+/// Probe one sysfs GPIO pair (SDA, SCL) × address range via bit-bang.
+pub fn scan_gpio_pair(sda: u32, scl: u32) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    for addr in ADDR_RANGE.clone() {
+        let Ok(bus) = BitBang::new(sda, scl, addr) else {
+            return hits; // pair unusable (stuck lines) — no point per-address
+        };
+        let mut s = Mlx90640::new(bus);
+        if let Ok(id) = s.read_id() {
+            if plausible_id(id) {
+                hits.push(Hit {
+                    bus: format!("gpio:{sda},{scl}"),
+                    addr,
+                    id,
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// `--gpio-candidates 226,227:8,10` → [(226,227), (8,10)] with the module
+/// pin-order footgun handled (SDA/SCL swapped is reported, not silently
+/// retried — an explicit pair beats magic).
+pub fn parse_gpio_candidates(spec: &str) -> Result<Vec<(u32, u32)>> {
+    let mut out = Vec::new();
+    for pair in spec.split(':') {
+        let mut it = pair.split(',');
+        let sda: u32 = it
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| crate::error::Error::Usage(format!("bad gpio pair: {pair}")))?;
+        let scl: u32 = it
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| crate::error::Error::Usage(format!("bad gpio pair: {pair}")))?;
+        out.push((sda, scl));
+    }
+    if out.is_empty() {
+        return Err(crate::error::Error::Usage(
+            "--gpio-candidates needs at least one SDA,SCL pair".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Resolve a working sensor transport for boot-time `bus = auto`:
+/// hardware TWI first (proper pull-ups present), then the classic
+/// Orange Pi Zero 3 PH2/PH3 pair as the bit-bang fallback.
+pub fn auto_detect() -> Option<(Hit, bool)> {
+    // (hit, is_gpio)
+    let twi = scan_twi();
+    if let Some(h) = twi.first() {
+        return Some((h.clone(), false));
+    }
+    let gpio = scan_gpio_pair(226, 227);
+    gpio.first().map(|h| (h.clone(), true))
+}
+
+/// Format a scan result as ready-to-paste config lines.
+pub fn config_snippet(hit: &Hit) -> String {
+    format!(
+        "[sensor]\nbus = {{ type = \"{}\", {} }}\naddr = {:#04x}\n",
+        if hit.bus.starts_with("twi:") {
+            "twi"
+        } else {
+            "gpio"
+        },
+        if hit.bus.starts_with("twi:") {
+            format!("\"{}\"", hit.bus.trim_start_matches("twi:"))
+        } else {
+            let pins = hit.bus.trim_start_matches("gpio:");
+            let (sda, scl) = pins.split_once(',').unwrap_or((pins, pins));
+            format!("sda = {sda}, scl = {scl}")
+        },
+        hit.addr,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpio_candidate_parsing() {
+        let v = parse_gpio_candidates("226,227:8,10").expect("parse");
+        assert_eq!(v, vec![(226, 227), (8, 10)]);
+        assert!(parse_gpio_candidates("").is_err());
+        assert!(parse_gpio_candidates("226").is_err());
+        assert!(parse_gpio_candidates("a,b").is_err());
+    }
+
+    #[test]
+    fn config_snippet_shapes() {
+        let twi = Hit {
+            bus: "twi:/dev/i2c-2".into(),
+            addr: 0x33,
+            id: 0x1901,
+        };
+        assert!(config_snippet(&twi).contains("bus = { type = \"twi\", \"/dev/i2c-2\" }"));
+        assert!(config_snippet(&twi).contains("addr = 0x33"));
+        let gpio = Hit {
+            bus: "gpio:226,227".into(),
+            addr: 0x30,
+            id: 0x1901,
+        };
+        assert!(config_snippet(&gpio).contains("sda = 226, scl = 227"));
+        assert!(config_snippet(&gpio).contains("addr = 0x30"));
+    }
+
+    #[test]
+    fn address_range_covers_straps() {
+        assert!(ADDR_RANGE.contains(&0x33));
+        assert!(ADDR_RANGE.contains(&0x30));
+        assert!(ADDR_RANGE.contains(&0x3E));
+        assert!(!ADDR_RANGE.contains(&0x3F));
+    }
+}

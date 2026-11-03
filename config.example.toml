@@ -5,9 +5,13 @@
 # and fill in the platform credentials — never commit the filled copy.
 
 [sensor]
-# Bus spec: gpio:SDA,SCL (sysfs bit-bang, works with weak on-board pull-ups)
-# or twi:/dev/i2c-N (hardware TWI — needs the 2x4.7k pull-up fix).
+# Bus spec: gpio:SDA,SCL (sysfs bit-bang, works with weak on-board pull-ups),
+# twi:"/dev/i2c-N" (hardware TWI — needs proper pull-ups) or "auto"
+# (boot-time discovery: TWI first, bit-bang fallback). Run `scan` on a new
+# board/module to find the working combination (docs/porting.md).
 bus = { type = "gpio", sda = 226, scl = 227 }
+# MLX90640 7-bit address: factory 0x33; A1/A0 straps move it 0x30..=0x3E.
+addr = 0x33
 
 [stream]
 # GB28181 pseudo-color stream shape (NVR baseline: 320x240 @ 2-8 fps).

@@ -44,12 +44,32 @@ const P_HI: f32 = 0.98;
 const GAMMA: f32 = 0.7;
 
 /// Render the sensor grid to an RGB image of `out_w` x `out_h` (bilinear).
+/// Auto percentile stretch.
 pub fn render_rgb(to: &[f32; PIXELS], out_w: usize, out_h: usize) -> Vec<u8> {
-    // Percentile stretch via a coarse histogram over the To frame.
-    let mut sorted = *to;
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let lo = sorted[((PIXELS as f32 * P_LO) as usize).min(PIXELS - 1)];
-    let hi = sorted[((PIXELS as f32 * P_HI) as usize).min(PIXELS - 1)];
+    render_rgb_range(to, out_w, out_h, None, None)
+}
+
+/// Render with an optional fixed display range (`lo`..`hi` °C); `None`
+/// falls back to the percentile stretch. Fixed ranges keep colors stable
+/// across frames (comparable playback) — e.g. `?lo=25&hi=45`.
+pub fn render_rgb_range(
+    to: &[f32; PIXELS],
+    out_w: usize,
+    out_h: usize,
+    lo_override: Option<f32>,
+    hi_override: Option<f32>,
+) -> Vec<u8> {
+    let (lo, hi) = match (lo_override, hi_override) {
+        (Some(lo), Some(hi)) if hi - lo > 1e-3 => (lo, hi),
+        _ => {
+            let mut sorted = *to;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            (
+                sorted[((PIXELS as f32 * P_LO) as usize).min(PIXELS - 1)],
+                sorted[((PIXELS as f32 * P_HI) as usize).min(PIXELS - 1)],
+            )
+        }
+    };
     let span = if hi - lo > 1e-3 { hi - lo } else { 1.0 };
 
     let grid_rgb: Vec<(u8, u8, u8)> = to

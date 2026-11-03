@@ -9,13 +9,23 @@ use serde::Deserialize;
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum BusSpec {
     Twi(String),
-    Gpio { sda: u32, scl: u32 },
+    Gpio {
+        sda: u32,
+        scl: u32,
+    },
+    /// Boot-time discovery: hardware TWI buses first, then the classic
+    /// bit-bang fallback pair (226/227 on the Orange Pi Zero 3).
+    Auto,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SensorConfig {
     #[serde(default = "default_bus")]
     pub bus: BusSpec,
+    /// MLX90640 7-bit address (factory 0x33; A1/A0 straps move it in
+    /// 0x30..=0x3E — run `scan` when in doubt).
+    #[serde(default = "default_addr")]
+    pub addr: u8,
     /// Re-read the EEPROM every N sensor passes (0 = once at boot).
     /// Reserved for the hot-swap/debug path; the sensor loop reads EE once
     /// today and this knob is honored when EEPROM refresh lands.
@@ -27,11 +37,15 @@ pub struct SensorConfig {
 fn default_bus() -> BusSpec {
     BusSpec::Gpio { sda: 226, scl: 227 }
 }
+fn default_addr() -> u8 {
+    0x33
+}
 
 impl Default for SensorConfig {
     fn default() -> Self {
         Self {
             bus: default_bus(),
+            addr: default_addr(),
             eeprom_refresh_passes: 0,
         }
     }
@@ -86,6 +100,20 @@ pub struct HttpConfig {
     pub enabled: bool,
     #[serde(default = "default_http_port")]
     pub port: u16,
+    /// Admin password for the family SPEC session envelope. Empty (default)
+    /// = open bring-up mode (no login; LAN only). Constrained ASCII — the
+    /// mini JSON parser on the login path does not unescape quotes.
+    #[serde(default)]
+    pub password: String,
+    /// Static bearer token for machine consumers (`Authorization: Bearer
+    /// <token>`); empty = off. Either this or a session cookie passes the
+    /// /api/* gate when a password is set.
+    #[serde(default)]
+    pub api_token: String,
+    /// Family webui bundle directory (`make sync-thermal` destination).
+    /// Falls back to the built-in viewer page when absent.
+    #[serde(default = "default_static_dir")]
+    pub static_dir: String,
 }
 
 fn default_http_enabled() -> bool {
@@ -94,12 +122,18 @@ fn default_http_enabled() -> bool {
 fn default_http_port() -> u16 {
     8098
 }
+fn default_static_dir() -> String {
+    "/usr/local/share/mibee-eye-thermal/static".into()
+}
 
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             enabled: default_http_enabled(),
             port: default_http_port(),
+            password: String::new(),
+            api_token: String::new(),
+            static_dir: default_static_dir(),
         }
     }
 }
