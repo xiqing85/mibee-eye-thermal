@@ -340,7 +340,13 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<WebCtx>) -> std::io::Result
                 let st = ctx.hub.status();
                 let lo = q("lo").and_then(|v| v.parse::<f32>().ok());
                 let hi = q("hi").and_then(|v| v.parse::<f32>().ok());
-                let rgb = render_rgb_range(&st.to, 640, 480, lo, hi);
+                // On-image temperature overlays by default (thermal-camera
+                // look); `?overlay=0` renders the clean pseudo-color frame.
+                let rgb = if q("overlay").as_deref() == Some("0") {
+                    render_rgb_range(&st.to, 640, 480, lo, hi)
+                } else {
+                    crate::render::render_rgb_annotated(&st.to, 640, 480, lo, hi)
+                };
                 let bmp = rgb_to_bmp(&rgb, 640, 480);
                 respond(&mut stream, 200, "image/bmp", &bmp).await
             }
@@ -619,24 +625,13 @@ background:linear-gradient(90deg,#000000,#120840,#400c78,#8c1e82,#d8583c,#f8a830
 <div id=wrap><img id=f src="/api/thermal/snapshot?format=bmp"><canvas id=c></canvas></div>
 <div id=legend></div><div id=lgrad><span id=llo>...</span><span id=lmid>...</span><span id=lhi>...</span></div>
 <p id=s>warming up&hellip;</p>
-<p style="font-size:12px;color:#888">sensor bit-bang ~40s/frame until pull-up fix &middot; hover the image for point temperature &middot; \u00d7 marks max/min</p>
+<p style="font-size:12px;color:#888">sensor bit-bang ~40s/frame until pull-up fix &middot; hover the image for point temperature &middot; image carries max/min/center readings</p>
 <div id=tip></div>
 <script>
 let grid=null,GW=32,GH=24,last=null;
 const f=document.getElementById('f'),c=document.getElementById('c'),tip=document.getElementById('tip');
-f.onload=()=>draw();
-function draw(){
- if(!last)return;
- c.width=f.clientWidth;c.height=f.clientHeight;
- const x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);
- x.font='bold 13px sans-serif';x.textAlign='left';
- [[last.max,'#fff'],[last.min,'#7cf']].forEach(([m,col])=>{
-   const px=(m.x+0.5)/GW*c.width, py=(m.y+0.5)/GH*c.height;
-   x.strokeStyle=col;x.lineWidth=2;
-   x.beginPath();x.moveTo(px-9,py);x.lineTo(px+9,py);x.moveTo(px,py-9);x.lineTo(px,py+9);x.stroke();
-   x.fillStyle=col;x.fillText(m.value_c.toFixed(1)+'\u00b0C',Math.min(px+12,c.width-58),Math.max(py-8,14));
- });
-}
+// Temperature markers are baked into the image by the renderer
+// (max/min crosshairs + center spot); this page keeps hover readout only.
 c.addEventListener('mousemove',e=>{
  if(!grid){tip.style.display='none';return;}
  const r=c.getBoundingClientRect();

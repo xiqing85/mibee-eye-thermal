@@ -43,10 +43,19 @@ const P_LO: f32 = 0.02;
 const P_HI: f32 = 0.98;
 const GAMMA: f32 = 0.7;
 
-/// Render the sensor grid to an RGB image of `out_w` x `out_h` (bilinear).
-/// Auto percentile stretch.
-pub fn render_rgb(to: &[f32; PIXELS], out_w: usize, out_h: usize) -> Vec<u8> {
-    render_rgb_range(to, out_w, out_h, None, None)
+/// Render with on-image temperature overlays (max/min crosshairs with
+/// labels + center spot) — the thermal-camera look shared by every
+/// consumer (webui card, viewer, snapshot, GB28181 stream).
+pub fn render_rgb_annotated(
+    to: &[f32; PIXELS],
+    out_w: usize,
+    out_h: usize,
+    lo: Option<f32>,
+    hi: Option<f32>,
+) -> Vec<u8> {
+    let mut rgb = render_rgb_range(to, out_w, out_h, lo, hi);
+    overlay_temperatures(to, &mut rgb, out_w, out_h);
+    rgb
 }
 
 /// Render with an optional fixed display range (`lo`..`hi` °C); `None`
@@ -180,6 +189,175 @@ pub fn rgb_to_bmp(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
     out
 }
 
+/// Minimal 5x7 bitmap font for on-image temperature labels (digits, decimal
+/// point, minus, C, degree ring) — no font dependency, rows are 5-bit masks.
+const FONT: [(char, [u8; 7]); 14] = [
+    ('0', [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E]),
+    ('1', [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E]),
+    ('2', [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F]),
+    ('3', [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E]),
+    ('4', [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02]),
+    ('5', [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E]),
+    ('6', [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E]),
+    ('7', [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08]),
+    ('8', [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E]),
+    ('9', [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C]),
+    ('.', [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C]),
+    ('-', [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00]),
+    ('C', [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E]),
+    ('\u{00b0}', [0x06, 0x09, 0x06, 0x00, 0x00, 0x00, 0x00]),
+];
+
+fn glyph(ch: char) -> Option<[u8; 7]> {
+    FONT.iter().find(|(c, _)| *c == ch).map(|(_, rows)| *rows)
+}
+
+/// Draw `text` into an RGB buffer at (x, y) with integer `scale`, on a
+/// solid dark box for contrast. Returns the box extent.
+fn draw_text(rgb: &mut [u8], w: usize, h: usize, x: usize, y: usize, text: &str, scale: usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let box_w = chars.len() * 6 * scale + 2 * scale;
+    let box_h = 7 * scale + 2 * scale;
+    // Clamp the label box inside the image with a small margin.
+    const MARGIN: usize = 4;
+    let x = x.min(w.saturating_sub(box_w + MARGIN));
+    let y = y.min(h.saturating_sub(box_h + MARGIN));
+    for dy in 0..box_h {
+        for dx in 0..box_w {
+            let p = ((y + dy) * w + (x + dx)) * 3;
+            rgb[p] = 12;
+            rgb[p + 1] = 12;
+            rgb[p + 2] = 16;
+        }
+    }
+    for (ci, &ch) in chars.iter().enumerate() {
+        let Some(rows) = glyph(ch) else { continue };
+        for (ry, row) in rows.iter().enumerate() {
+            for rx in 0..5 {
+                if row & (1 << (4 - rx)) == 0 {
+                    continue;
+                }
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        let px = x + scale + (ci * 6 + rx) * scale + sx;
+                        let py = y + scale + (ry * scale) + sy;
+                        if px >= w || py >= h {
+                            continue;
+                        }
+                        let p = (py * w + px) * 3;
+                        rgb[p] = 255;
+                        rgb[p + 1] = 255;
+                        rgb[p + 2] = 255;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn crosshair(rgb: &mut [u8], w: usize, h: usize, cx: usize, cy: usize, r: usize, cr: (u8, u8, u8)) {
+    // 1px dark outline first so the marker survives bright (white-hot)
+    // backgrounds, then the color core on top.
+    for pass in [((0u8, 0u8, 0u8), 1i32), (cr, 0)] {
+        for d in -(r as i32)..=(r as i32) {
+            for o in [-pass.1, pass.1] {
+                for (px, py) in [
+                    (cx as i32 + d + o, cy as i32),
+                    (cx as i32, cy as i32 + d + o),
+                ] {
+                    if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+                        continue;
+                    }
+                    let p = (py as usize * w + px as usize) * 3;
+                    rgb[p] = pass.0 .0;
+                    rgb[p + 1] = pass.0 .1;
+                    rgb[p + 2] = pass.0 .2;
+                }
+            }
+        }
+    }
+}
+
+/// Bake thermal-camera-style overlays onto a rendered frame: max/min
+/// crosshairs with value labels and a center-spot reading. This is the
+/// one path every consumer sees (webui card, /viewer, snapshot, GB28181
+/// stream recordings).
+pub fn overlay_temperatures(to: &[f32; PIXELS], rgb: &mut [u8], w: usize, h: usize) {
+    let scale = if w >= 480 { 2 } else { 1 };
+    let cell_w = w / WIDTH;
+    let cell_h = h / HEIGHT;
+
+    let (mut max_i, mut min_i) = (0usize, 0usize);
+    for (i, v) in to.iter().enumerate() {
+        if *v > to[max_i] {
+            max_i = i;
+        }
+        if *v < to[min_i] {
+            min_i = i;
+        }
+    }
+    let label = |v: f32| -> String {
+        // One decimal, degree ring, C — e.g. "40.9\u{00b0}C".
+        format!("{v:.1}\u{00b0}C")
+    };
+
+    // Max: white crosshair + label above-right.
+    let (mx, my) = (max_i % WIDTH, max_i / WIDTH);
+    crosshair(
+        rgb,
+        w,
+        h,
+        (mx + 1) * cell_w - cell_w / 2,
+        (my + 1) * cell_h - cell_h / 2,
+        (cell_w + cell_h) / 3,
+        (255, 255, 255),
+    );
+    draw_text(
+        rgb,
+        w,
+        h,
+        (mx + 1) * cell_w + cell_w / 2,
+        ((my + 1) * cell_h).saturating_sub(11 * scale) - cell_h / 2,
+        &label(to[max_i]),
+        scale,
+    );
+
+    // Min: cyan crosshair + label below-left.
+    let (nx, ny) = (min_i % WIDTH, min_i / WIDTH);
+    crosshair(
+        rgb,
+        w,
+        h,
+        (nx + 1) * cell_w - cell_w / 2,
+        (ny + 1) * cell_h - cell_h / 2,
+        (cell_w + cell_h) / 3,
+        (124, 246, 255),
+    );
+    draw_text(
+        rgb,
+        w,
+        h,
+        ((nx + 1) * cell_w).saturating_sub(18 * scale),
+        (ny + 1) * cell_h + cell_h / 2,
+        &label(to[min_i]),
+        scale,
+    );
+
+    // Center spot: small ring + reading below.
+    let c_i = (HEIGHT / 2) * WIDTH + WIDTH / 2;
+    let (cx, cy) = (w / 2, h / 2);
+    crosshair(rgb, w, h, cx, cy, cell_w / 2, (255, 220, 90));
+    draw_text(
+        rgb,
+        w,
+        h,
+        cx.saturating_sub(9 * scale),
+        cy + cell_h / 2,
+        &label(to[c_i]),
+        scale,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,7 +382,7 @@ mod tests {
     fn render_sizes_and_i420_layout() {
         let mut to = [25f32; PIXELS];
         to[0] = 40.0; // one hot corner to exercise the stretch
-        let rgb = render_rgb(&to, 320, 240);
+        let rgb = render_rgb_range(&to, 320, 240, None, None);
         assert_eq!(rgb.len(), 320 * 240 * 3);
         let i420 = rgb_to_i420(&rgb, 320, 240);
         assert_eq!(i420.len(), 320 * 240 * 3 / 2);
