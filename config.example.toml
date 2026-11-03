@@ -1,0 +1,42 @@
+# mibee-eye-thermal service configuration.
+#
+# The bring-up CLI (`id`/`frame`/`ta`) ignores this file; only `serve` reads
+# it. Copy to the deployment host (e.g. /etc/mibee-eye-thermal/config.toml)
+# and fill in the platform credentials — never commit the filled copy.
+
+[sensor]
+# Bus spec: gpio:SDA,SCL (sysfs bit-bang, works with weak on-board pull-ups)
+# or twi:/dev/i2c-N (hardware TWI — needs the 2x4.7k pull-up fix).
+bus = { type = "gpio", sda = 226, scl = 227 }
+
+[stream]
+# GB28181 pseudo-color stream shape (NVR baseline: 320x240 @ 2-8 fps).
+width = 320
+height = 240
+fps = 2.0
+bitrate_bps = 512000
+# Emissivity of the surveyed scene (0 < e <= 1); calibrate per deployment.
+emissivity = 1.0
+
+[http]
+# Standalone SPEC v1 thermal surface (bring-up mode, no session auth —
+# keep it on the LAN). The family webui envelope arrives with M5.
+enabled = true
+port = 8098
+
+[gb28181]
+enabled = false
+platform_sip_address = "192.168.63.30"
+platform_sip_port = 5060
+device_id = "34020000001320000003"
+channel_id = "34020000001320000003"
+sip_domain = "3402000000"
+password = "change-me"
+local_sip_port = 5060
+register_interval_secs = 60
+heartbeat_interval_secs = 60
+heartbeat_timeout_count = 3
+# 2022 光电成像类型: 2 = thermal imaging — the whole point of this camera.
+photoelectric_imaging_type = 2
+device_name = "MLX90640 Thermal"
+manufacturer = "MiBee"

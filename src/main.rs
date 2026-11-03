@@ -3,11 +3,17 @@
 //! Bring-up CLI (v0.0.x):
 //!   mibee-eye-thermal id     --bus twi:/dev/i2c-2
 //!   mibee-eye-thermal frame  --bus gpio:226,227
+//!   mibee-eye-thermal ta     --bus gpio:226,227   (EE decode + Ta/To frame)
 //! The service build (web/RTSP/GB28181) layers on top of the same driver.
 
+mod ee;
 mod error;
+mod httpsrv;
+mod hub;
 mod i2c;
 mod mlx90640;
+mod render;
+mod settings;
 
 use error::Result;
 use i2c::{bitbang::BitBang, twi::Twi};
@@ -18,17 +24,19 @@ enum Bus {
     Gpio(u32, u32),
 }
 
-fn parse_args() -> Result<(String, Bus)> {
+fn parse_args() -> Result<(String, Bus, Option<String>)> {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args
         .get(1)
         .ok_or_else(|| {
             error::Error::Usage(
-                "usage: mibee-eye-thermal <id|frame> [--bus <twi:/dev/i2c-N|gpio:SDA,SCL>]".into(),
+                "usage: mibee-eye-thermal <id|frame|ta|serve> [--bus <twi:/dev/i2c-N|gpio:SDA,SCL>] [--config <path>]"
+                    .into(),
             )
         })?
         .clone();
     let mut bus = Bus::Twi("/dev/i2c-2".into());
+    let mut config_path: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -52,21 +60,29 @@ fn parse_args() -> Result<(String, Bus)> {
                     return Err(error::Error::Usage(format!("unknown bus spec: {spec}")));
                 }
             }
+            "--config" => {
+                i += 1;
+                config_path = Some(
+                    args.get(i)
+                        .ok_or_else(|| error::Error::Usage("--config needs a path".into()))?
+                        .clone(),
+                );
+            }
             other => return Err(error::Error::Usage(format!("unknown arg: {other}"))),
         }
         i += 1;
     }
-    Ok((cmd, bus))
+    Ok((cmd, bus, config_path))
 }
 
 fn run() -> Result<()> {
-    let (cmd, bus) = parse_args()?;
+    let (cmd, bus, config_path) = parse_args()?;
     match cmd.as_str() {
         "id" => {
             let (id, status, control, ptat): (u16, u16, u16, i16);
             match &bus {
                 Bus::Twi(dev) => {
-                    let mut s = Mlx90640::new(Twi::open(dev, mlx90640::DEFAULT_ADDR)?);
+                    let mut s = Mlx90640::new(Twi::open(dev.as_str(), mlx90640::DEFAULT_ADDR)?);
                     id = s.read_id()?;
                     status = s.read_status()?;
                     control = s.read_control()?;
@@ -81,11 +97,57 @@ fn run() -> Result<()> {
                 }
             }
             println!("ID     0x240C = {id:#06x}");
-            println!("status 0x0700 = {status:#06x}");
-            println!("ctrl   0x0702 = {control:#06x}");
+            println!("status 0x8000 = {status:#06x}");
+            println!("ctrl   0x800D = {control:#06x}");
             println!(
-                "PTAT   0x0708 = {ptat}  (negative => suspect supply, see docs/hardware-notes.md)"
+                "PTAT   0x0720 = {ptat}  (positive hundreds..thousands = healthy supply; \
+                 see docs/mlx90640-temperature-math.md)"
             );
+        }
+        "ta" => {
+            // Full compensation chain: EE decode -> aux/frame read -> To matrix.
+            let (to, common): ([f32; mlx90640::PIXELS], ee::CommonParams);
+            match &bus {
+                Bus::Twi(dev) => {
+                    let mut s = Mlx90640::new(Twi::open(dev, mlx90640::DEFAULT_ADDR)?);
+                    let eew = s.read_eeprom()?;
+                    let params = ee::Eeprom::from_words(&eew);
+                    let aux = s.read_aux()?;
+                    let frame = s.read_frame_raw()?;
+                    let r = params.compute_to(&frame, &aux, 1.0, None);
+                    to = r.0;
+                    common = r.1;
+                }
+                Bus::Gpio(sda, scl) => {
+                    let mut s = Mlx90640::new(BitBang::new(*sda, *scl, mlx90640::DEFAULT_ADDR)?);
+                    let eew = s.read_eeprom()?;
+                    let params = ee::Eeprom::from_words(&eew);
+                    let aux = s.read_aux()?;
+                    let frame = s.read_frame_raw()?;
+                    let r = params.compute_to(&frame, &aux, 1.0, None);
+                    to = r.0;
+                    common = r.1;
+                }
+            }
+            let min = to.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = to.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mean = to.iter().map(|v| f64::from(*v)).sum::<f64>() / to.len() as f64;
+            println!(
+                "Vdd={:.3}V  Ta={:.2}°C   To: n={} min={:.1} max={:.1} mean={:.1} °C",
+                common.vdd,
+                common.ta,
+                to.len(),
+                min,
+                max,
+                mean
+            );
+            for (y, row) in to.chunks(mlx90640::WIDTH).enumerate() {
+                if y % 4 == 0 {
+                    let line: Vec<String> =
+                        row.iter().step_by(4).map(|v| format!("{v:5.0}")).collect();
+                    println!("  {}", line.join(" "));
+                }
+            }
         }
         "frame" => {
             let frame = match &bus {
@@ -107,8 +169,94 @@ fn run() -> Result<()> {
                 println!("  {}", line.join(" "));
             }
         }
+        "serve" => run_serve(config_path)?,
         other => return Err(error::Error::Usage(format!("unknown command: {other}"))),
     }
+    Ok(())
+}
+
+/// IFrameCmd → next encoded frame is IDR (DeviceControl seam).
+struct IframeHook {
+    hub: std::sync::Arc<hub::ThermalHub>,
+}
+
+impl gb28181_rs::server::DeviceControlHandler for IframeHook {
+    fn on_force_iframe(&self) {
+        self.hub.request_idr();
+    }
+}
+
+fn run_serve(config_path: Option<String>) -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let path = config_path.unwrap_or_else(|| "config.toml".into());
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| error::Error::Usage(format!("cannot read config {path}: {e}")))?;
+    let cfg = settings::Settings::load_toml(&text)
+        .map_err(|e| error::Error::Usage(format!("{path}: {e}")))?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| error::Error::Usage(format!("tokio runtime: {e}")))?;
+
+    runtime.block_on(async move {
+        let hub = hub::ThermalHub::start(&cfg.stream, &cfg.sensor.bus);
+        eprintln!(
+            "thermal hub: {}x{} @ {:.1} fps, sensor bus {}",
+            cfg.stream.width,
+            cfg.stream.height,
+            cfg.stream.fps,
+            match &cfg.sensor.bus {
+                settings::BusSpec::Twi(dev) => dev.clone(),
+                settings::BusSpec::Gpio { sda, scl } => format!("gpio:{sda},{scl}"),
+            }
+        );
+
+        let http_task = if cfg.http.enabled {
+            let hub = std::sync::Arc::clone(&hub);
+            let port = cfg.http.port;
+            Some(tokio::spawn(async move {
+                if let Err(e) = httpsrv::serve(hub, port).await {
+                    eprintln!("http server error: {e}");
+                }
+            }))
+        } else {
+            None
+        };
+
+        let mut gb_handle = None;
+        if cfg.gb28181.enabled {
+            let au_source: std::sync::Arc<dyn gb28181_rs::frame::FrameSource> =
+                std::sync::Arc::clone(&hub) as _;
+            let server = gb28181_rs::server::Gb28181Server::new(cfg.gb28181.clone(), au_source)
+                .with_control_handler(Some(std::sync::Arc::new(IframeHook {
+                    hub: std::sync::Arc::clone(&hub),
+                })));
+            match server.spawn().await {
+                Ok(handle) => {
+                    eprintln!("gb28181: registered (device {})", cfg.gb28181.device_id);
+                    gb_handle = Some(handle);
+                }
+                Err(e) => eprintln!("gb28181: spawn failed: {e}"),
+            }
+        }
+
+        // Run until SIGINT/SIGTERM, then deregister if we ever registered.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+        eprintln!("serve: shutting down");
+        if let Some(handle) = gb_handle.as_mut() {
+            let _ = handle.shutdown_with_deregister().await;
+        }
+        hub.stop();
+        if let Some(task) = http_task {
+            task.abort();
+        }
+    });
     Ok(())
 }
 
