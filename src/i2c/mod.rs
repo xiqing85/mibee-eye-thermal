@@ -19,6 +19,9 @@ pub trait MlxBus {
     fn read_block(&mut self, reg: u16, buf: &mut [u8]) -> crate::Result<()>;
 
     /// Write a single 16-bit register.
+    /// Reserved for the configuration milestone (refresh rate / chess mode);
+    /// bring-up is read-only.
+    #[allow(dead_code)]
     fn write_reg16(&mut self, reg: u16, val: u16) -> crate::Result<()>;
 
     /// Read a run of 16-bit words into `out` (block read, chunked).
