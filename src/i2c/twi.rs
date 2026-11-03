@@ -4,7 +4,7 @@
 //! MLX90640 needs a combined write(2B reg addr) + repeated-start read —
 //! exactly one `i2c_rdwr_ioctl_data` with two messages.
 
-use crate::{Error, Result};
+use crate::error::{Error, Result};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 
@@ -28,11 +28,12 @@ struct I2cRdwrIoctlData {
 
 pub struct Twi {
     file: File,
-    addr: u16,
+    addr: u8,
 }
 
 impl Twi {
-    pub fn open(path: &str, addr: u16) -> Result<Self> {
+    /// `addr` is the 7-bit device address (MLX90640 factory default 0x33).
+    pub fn open(path: &str, addr: u8) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         Ok(Self { file, addr })
     }
@@ -44,14 +45,14 @@ impl Twi {
         let mut out = vec![0u8; rd_len];
         let mut msgs = [
             I2cMsg {
-                addr: self.addr,
+                addr: u16::from(self.addr),
                 flags: 0,
                 len: wr.len() as u16,
                 _pad: 0,
                 buf: wr.as_mut_ptr(),
             },
             I2cMsg {
-                addr: self.addr,
+                addr: u16::from(self.addr),
                 flags: I2C_M_RD,
                 len: rd_len as u16,
                 _pad: 0,
@@ -91,7 +92,7 @@ impl crate::i2c::MlxBus for Twi {
         let mut wr = vec![(reg >> 8) as u8, reg as u8];
         wr.extend_from_slice(&val.to_be_bytes());
         let mut msgs = [I2cMsg {
-            addr: self.addr,
+            addr: u16::from(self.addr),
             flags: 0,
             len: wr.len() as u16,
             _pad: 0,

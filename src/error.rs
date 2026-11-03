@@ -7,6 +7,8 @@ pub enum Error {
     /// Underlying bus transport failed (errno or protocol NAK).
     Bus(String),
     /// Sensor returned data that violates the MLX90640 register-map contract.
+    /// (Lands with the EE-calibration / frame-extraction milestone.)
+    #[allow(dead_code)]
     Sensor(String),
     /// Bad usage / configuration.
     Usage(String),

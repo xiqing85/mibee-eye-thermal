@@ -6,7 +6,7 @@
 //! read full frames (768 words in ~40 s) while the hardware is being fixed.
 //! Timing constants mirror the field-proven python probe (`tools/mlx-frame.py`).
 
-use crate::{Error, Result};
+use crate::error::{Error, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -24,20 +24,17 @@ impl Gpio {
     fn new(num: u32) -> Result<Self> {
         let base = PathBuf::from("/sys/class/gpio");
         if !base.join(format!("gpio{num}")).exists() {
-            File::create(base.join("export"))?
-                .write_all(num.to_string().as_bytes())?;
-            std::thread::sleep(Duration::from_millis(50));
+            File::create(base.join("export"))?.write_all(num.to_string().as_bytes())?;
+            sleep(Duration::from_millis(50));
         }
         let root = base.join(format!("gpio{num}"));
         let g = Self { num, root };
-        g.rz(); // idle: released (input), pulled high
+        g.rz()?; // idle: released (input), pulled high
         Ok(g)
     }
 
     fn w(&self, name: &str, val: &str) -> Result<()> {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .open(self.root.join(name))?;
+        let mut f = OpenOptions::new().write(true).open(self.root.join(name))?;
         f.write_all(val.as_bytes())?;
         Ok(())
     }
@@ -70,6 +67,7 @@ impl Drop for Gpio {
 }
 
 pub struct BitBang {
+    addr: u8,
     sda: Gpio,
     scl: Gpio,
 }
@@ -79,9 +77,10 @@ fn d(n: u32) {
 }
 
 impl BitBang {
-    /// `sda`/`scl` are global sysfs GPIO numbers (e.g. PH2=226, PH3=227 on
-    /// the H616/H618 pinctrl at gpiochip0 base 0).
-    pub fn new(sda: u32, scl: u32) -> Result<Self> {
+    /// `sda`/`scl` are global sysfs GPIO numbers (PH2=226 / PH3=227 on the
+    /// H616/H618 pinctrl at gpiochip0, base 0). `addr` is the 7-bit address
+    /// (MLX90640 factory default 0x33).
+    pub fn new(sda: u32, scl: u32, addr: u8) -> Result<Self> {
         let sda = Gpio::new(sda)?;
         let scl = Gpio::new(scl)?;
         // Both lines must idle high — a stuck-low line means missing supply or
@@ -92,7 +91,7 @@ impl BitBang {
                 "SDA or SCL stuck low: check module VCC/GND and pull-ups".into(),
             ));
         }
-        Ok(Self { sda, scl })
+        Ok(Self { addr, sda, scl })
     }
 
     fn start(&mut self) -> Result<()> {
@@ -167,8 +166,7 @@ impl BitBang {
         d(3);
         self.scl.lo()?;
         d(1);
-        self.sda.rz()?;
-        Ok(())
+        self.sda.rz()
     }
 
     fn mnak(&mut self) -> Result<()> {
@@ -180,36 +178,13 @@ impl BitBang {
         d(1);
         Ok(())
     }
-}
 
-impl crate::i2c::MlxBus for BitBang {
-    fn read_reg16(&mut self, reg: u16) -> Result<u16> {
-        let mut b = [0u8; 2];
-        self.read_block(reg, &mut b)?;
-        Ok(u16::from_be_bytes(b))
-    }
-
-    fn read_block(&mut self, reg: u16, buf: &mut [u8]) -> Result<()> {
-        self.start()?;
-        let ok = self.send_byte(crate::i2c::bitbang::ADDR << 1)? // placeholder, set below
-            ;
-        let _ = ok;
-        unreachable!("replaced by read_block_at")
-    }
-
-    fn write_reg16(&mut self, _reg: u16, _val: u16) -> Result<()> {
-        Err(Error::Usage("bitbang write not implemented yet".into()))
-    }
-}
-
-impl BitBang {
-    const ADDR7: u8 = 0x33;
-
-    fn read_block_at(&mut self, addr: u8, reg: u16, buf: &mut [u8]) -> Result<()> {
+    fn read_block_at(&mut self, reg: u16, buf: &mut [u8]) -> Result<()> {
+        let addr = self.addr;
         self.start()?;
         if !self.send_byte(addr << 1)? {
             self.stop()?;
-            return Err(Error::Bus(format!("NAK addr {addr:#04x} (write)")));
+            return Err(Error::Bus(format!("NAK addr {addr:#04x} (write phase)")));
         }
         if !self.send_byte((reg >> 8) as u8)? {
             self.stop()?;
@@ -222,14 +197,15 @@ impl BitBang {
         self.rstart()?;
         if !self.send_byte((addr << 1) | 1)? {
             self.stop()?;
-            return Err(Error::Bus(format!("NAK addr {addr:#04x} (read)")));
+            return Err(Error::Bus(format!("NAK addr {addr:#04x} (read phase)")));
         }
+        let len = buf.len();
         for (i, slot) in buf.iter_mut().enumerate() {
             let mut b = 0u8;
             for _ in 0..8 {
                 b = (b << 1) | self.rd_bit()?;
             }
-            if i + 1 < buf.len() {
+            if i + 1 < len {
                 self.mack()?;
             } else {
                 self.mnak()?;
@@ -238,5 +214,23 @@ impl BitBang {
         }
         self.stop()?;
         Ok(())
+    }
+}
+
+impl crate::i2c::MlxBus for BitBang {
+    fn read_reg16(&mut self, reg: u16) -> Result<u16> {
+        let mut b = [0u8; 2];
+        self.read_block_at(reg, &mut b)?;
+        Ok(u16::from_be_bytes(b))
+    }
+
+    fn read_block(&mut self, reg: u16, buf: &mut [u8]) -> Result<()> {
+        self.read_block_at(reg, buf)
+    }
+
+    fn write_reg16(&mut self, _reg: u16, _val: u16) -> Result<()> {
+        // Only needed later (refresh-rate / chess-mode configuration); the
+        // bring-up path is read-only.
+        Err(Error::Usage("bitbang write not implemented yet".into()))
     }
 }
