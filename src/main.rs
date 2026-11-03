@@ -13,6 +13,7 @@ mod hub;
 mod i2c;
 mod mlx90640;
 mod render;
+mod scan;
 mod settings;
 
 use error::Result;
@@ -73,6 +74,15 @@ fn parse_args() -> Result<(String, Bus, Option<String>)> {
         i += 1;
     }
     Ok((cmd, bus, config_path))
+}
+
+/// Human-readable bus owner (sysfs name) — keeps scan output honest about
+/// which controller each /dev/i2c-N is (PMIC, HDMI DDC, pin header, ...).
+fn bus_owner(dev: &str) -> String {
+    let n = dev.rsplit('-').next().unwrap_or("");
+    std::fs::read_to_string(format!("/sys/bus/i2c/devices/i2c-{n}/name"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".into())
 }
 
 fn run() -> Result<()> {
@@ -170,6 +180,38 @@ fn run() -> Result<()> {
             }
         }
         "serve" => run_serve(config_path)?,
+        "scan" => {
+            let mut gpio_candidates: Vec<(u32, u32)> = vec![(226, 227)];
+            let args: Vec<String> = std::env::args().collect();
+            if let Some(i) = args.iter().position(|a| a == "--gpio-candidates") {
+                gpio_candidates =
+                    scan::parse_gpio_candidates(args.get(i + 1).ok_or_else(|| {
+                        error::Error::Usage("--gpio-candidates needs S,S:S,S".into())
+                    })?)?;
+            }
+            println!(
+                "scanning hardware TWI buses ({} devices)...",
+                scan::twi_devices().len()
+            );
+            for d in &scan::twi_devices() {
+                println!("  {d}: {}", bus_owner(d));
+            }
+            let mut hits = scan::scan_twi();
+            println!("scanning GPIO bit-bang candidates {:?}...", gpio_candidates);
+            for (sda, scl) in &gpio_candidates {
+                hits.extend(scan::scan_gpio_pair(*sda, *scl));
+            }
+            if hits.is_empty() {
+                println!("no MLX90640 found — check wiring/VCC and see docs/porting.md");
+            }
+            for h in &hits {
+                println!(
+                    "\nfound MLX90640: bus={} addr={:#04x} id={:#06x}",
+                    h.bus, h.addr, h.id
+                );
+                println!("config:\n{}", scan::config_snippet(h));
+            }
+        }
         other => return Err(error::Error::Usage(format!("unknown command: {other}"))),
     }
     Ok(())
@@ -200,7 +242,7 @@ fn run_serve(config_path: Option<String>) -> Result<()> {
         .map_err(|e| error::Error::Usage(format!("tokio runtime: {e}")))?;
 
     runtime.block_on(async move {
-        let hub = hub::ThermalHub::start(&cfg.stream, &cfg.sensor.bus);
+        let hub = hub::ThermalHub::start_with_addr(&cfg.stream, &cfg.sensor.bus, cfg.sensor.addr);
         eprintln!(
             "thermal hub: {}x{} @ {:.1} fps, sensor bus {}",
             cfg.stream.width,
@@ -209,20 +251,11 @@ fn run_serve(config_path: Option<String>) -> Result<()> {
             match &cfg.sensor.bus {
                 settings::BusSpec::Twi(dev) => dev.clone(),
                 settings::BusSpec::Gpio { sda, scl } => format!("gpio:{sda},{scl}"),
+                settings::BusSpec::Auto => "auto".into(),
             }
         );
 
-        let http_task = if cfg.http.enabled {
-            let hub = std::sync::Arc::clone(&hub);
-            let port = cfg.http.port;
-            Some(tokio::spawn(async move {
-                if let Err(e) = httpsrv::serve(hub, port).await {
-                    eprintln!("http server error: {e}");
-                }
-            }))
-        } else {
-            None
-        };
+        let mut alarm_notifier: Option<httpsrv::AlarmNotifier> = None;
 
         let mut gb_handle = None;
         if cfg.gb28181.enabled {
@@ -232,6 +265,8 @@ fn run_serve(config_path: Option<String>) -> Result<()> {
                 .with_control_handler(Some(std::sync::Arc::new(IframeHook {
                     hub: std::sync::Arc::clone(&hub),
                 })));
+            // Notifier must be captured before spawn() consumes the server.
+            alarm_notifier = Some(server.notifier());
             match server.spawn().await {
                 Ok(handle) => {
                     eprintln!("gb28181: registered (device {})", cfg.gb28181.device_id);
@@ -240,6 +275,24 @@ fn run_serve(config_path: Option<String>) -> Result<()> {
                 Err(e) => eprintln!("gb28181: spawn failed: {e}"),
             }
         }
+
+        let http_task = if cfg.http.enabled {
+            let ctx = std::sync::Arc::new(httpsrv::WebCtx::new(
+                std::sync::Arc::clone(&hub),
+                alarm_notifier.clone(),
+                cfg.http.password.clone(),
+                cfg.http.api_token.clone(),
+                std::path::PathBuf::from(&cfg.http.static_dir),
+                cfg.gb28181.effective_device_name(),
+            ));
+            Some(tokio::spawn(async move {
+                if let Err(e) = httpsrv::serve(ctx, cfg.http.port).await {
+                    eprintln!("http server error: {e}");
+                }
+            }))
+        } else {
+            None
+        };
 
         // Run until SIGINT/SIGTERM, then deregister if we ever registered.
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())

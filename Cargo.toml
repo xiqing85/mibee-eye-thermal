@@ -14,7 +14,7 @@ gb28181-rs = "0.14.1"
 openh264 = "0.9.8"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs"] }
 toml = "0.8"
 
 [profile.release]

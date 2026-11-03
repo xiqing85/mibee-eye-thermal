@@ -108,9 +108,11 @@ impl ThermalHub {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// Spawn the sensor + encoder threads. The hub itself is inert data —
-    /// production wiring happens here.
-    pub fn start(cfg: &StreamConfig, bus: &BusSpec) -> Arc<ThermalHub> {
+    /// Spawn the sensor + encoder threads with an explicit sensor address
+    /// (A1/A0 straps move MLX90640 across 0x30..=0x3E; `scan` finds the
+    /// live one). The hub itself is inert data — production wiring happens
+    /// here.
+    pub fn start_with_addr(cfg: &StreamConfig, bus: &BusSpec, addr: u8) -> Arc<ThermalHub> {
         let hub = Arc::new(ThermalHub {
             subs: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
@@ -127,7 +129,7 @@ impl ThermalHub {
             let emissivity = cfg.emissivity;
             thread::Builder::new()
                 .name("mlx-sensor".into())
-                .spawn(move || sensor_loop(hub, bus, emissivity))
+                .spawn(move || sensor_loop(hub, bus, addr, emissivity))
                 .expect("spawn sensor thread");
         }
 
@@ -203,28 +205,54 @@ impl MlxBus for AnyBus {
     }
 }
 
-fn open_bus(spec: &BusSpec) -> crate::Result<AnyBus> {
+fn open_bus(spec: &BusSpec, addr: u8) -> crate::Result<AnyBus> {
     match spec {
-        BusSpec::Twi(dev) => Ok(AnyBus::Twi(Twi::open(dev, crate::mlx90640::DEFAULT_ADDR)?)),
+        BusSpec::Twi(dev) => Ok(AnyBus::Twi(Twi::open(dev, addr)?)),
         BusSpec::Gpio { sda, scl } => {
             release_i2c_pins(*sda, *scl);
-            Ok(AnyBus::Gpio(BitBang::new(
-                *sda,
-                *scl,
-                crate::mlx90640::DEFAULT_ADDR,
-            )?))
+            Ok(AnyBus::Gpio(BitBang::new(*sda, *scl, addr)?))
+        }
+        BusSpec::Auto => {
+            // Boot/hot-plug discovery: hardware TWI first, bit-bang fallback.
+            // The detected address is the authoritative one (something
+            // answered at it); the configured `addr` is ignored on this path.
+            match crate::scan::auto_detect() {
+                Some((hit, false)) => {
+                    let dev = hit.bus.trim_start_matches("twi:").to_string();
+                    Ok(AnyBus::Twi(Twi::open(&dev, hit.addr)?))
+                }
+                Some((hit, true)) => {
+                    let pins = hit.bus.trim_start_matches("gpio:");
+                    let (sda, scl) = pins.split_once(',').ok_or_else(|| {
+                        crate::error::Error::Bus("auto-detect returned bad pair".into())
+                    })?;
+                    let (sda, scl): (u32, u32) = (
+                        sda.parse().map_err(|_| {
+                            crate::error::Error::Bus("auto-detect returned bad pin".into())
+                        })?,
+                        scl.parse().map_err(|_| {
+                            crate::error::Error::Bus("auto-detect returned bad pin".into())
+                        })?,
+                    );
+                    release_i2c_pins(sda, scl);
+                    Ok(AnyBus::Gpio(BitBang::new(sda, scl, hit.addr)?))
+                }
+                None => Err(crate::error::Error::Bus(
+                    "auto-detect found no MLX90640 (see `mibee-eye-thermal scan`)".into(),
+                )),
+            }
         }
     }
 }
 
-fn sensor_loop(hub: Arc<ThermalHub>, bus: BusSpec, emissivity: f64) {
+fn sensor_loop(hub: Arc<ThermalHub>, bus: BusSpec, addr: u8, emissivity: f64) {
     // First synthetic frame already in place; keep producing real ones.
     let mut eeprom: Option<Eeprom> = None;
     let mut failures = 0u32;
     while !hub.stop.load(Ordering::Relaxed) {
         let started = Instant::now();
         let pass = (|| -> Option<([f32; PIXELS], CommonParams)> {
-            let bus = match open_bus(&bus) {
+            let bus = match open_bus(&bus, addr) {
                 Ok(b) => b,
                 Err(e) => {
                     hub.status.write().expect("status lock").last_sensor_error =
