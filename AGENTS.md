@@ -42,6 +42,10 @@ MiBee Eye 家族的热成像成员：MLX90640（32×24 远红外阵列）→ GB2
 - `tools/mlx-*.py`：板上验证过的探针（位模拟扫地址双极性/寄存器读/整帧 dump），
   排障时先 unbind TWI2 再用
 
+## 开发日志
+
+工作区定规（2026-11-03）：本仓一切实质进展/难点/决策当天写入 `../mibee-dev-journal/teams/eye/<YYYY-MM>.md` 并推送（规范见该仓 00-规范；凭据永不入仓）。
+
 ## 对接 MiBeeNVR（.30）路线
 
 内网 Gitea issue 跟踪（总跟踪 issue #1）：GB28181 设备注册（gb28181-rs pin 最新

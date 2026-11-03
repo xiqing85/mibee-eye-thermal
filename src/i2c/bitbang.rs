@@ -76,6 +76,32 @@ fn d(n: u32) {
     sleep(D * n);
 }
 
+/// Classic I2C bus recovery: toggle SCL with SDA released until the slave
+/// lets SDA rise (≤32 clocks covers any reasonable outstanding transfer),
+/// then generate a STOP so the slave resynchronizes to an idle bus.
+fn recover_bus(sda: &Gpio, scl: &Gpio) -> Result<()> {
+    for _ in 0..32 {
+        scl.lo()?;
+        d(1);
+        scl.rz()?;
+        d(2); // generous: weak pull-up rise is 240-510 µs
+        if sda.rd()? != 0 {
+            // SDA released — finish with a STOP condition.
+            scl.lo()?;
+            d(1);
+            sda.lo()?;
+            d(1);
+            scl.rz()?;
+            d(2);
+            sda.rz()?;
+            d(2);
+            return Ok(());
+        }
+    }
+    // Still low after 32 clocks — genuinely stuck hardware.
+    Ok(())
+}
+
 impl BitBang {
     /// `sda`/`scl` are global sysfs GPIO numbers (PH2=226 / PH3=227 on the
     /// H616/H618 pinctrl at gpiochip0, base 0). `addr` is the 7-bit address
@@ -83,12 +109,24 @@ impl BitBang {
     pub fn new(sda: u32, scl: u32, addr: u8) -> Result<Self> {
         let sda = Gpio::new(sda)?;
         let scl = Gpio::new(scl)?;
-        // Both lines must idle high — a stuck-low line means missing supply or
-        // a short; report it explicitly instead of scanning into the void.
+        // Both lines must idle high — a stuck-low SDA usually means the slave
+        // is parked mid-transaction (a previous master died mid-block-read;
+        // MLX90640 never times out and holds SDA low awaiting clocks). Clock
+        // it out before declaring the bus dead: SCL toggles with SDA
+        // released until SDA rises, then a STOP condition resyncs the slave.
         d(2);
-        if sda.rd()? == 0 || scl.rd()? == 0 {
+        if sda.rd()? == 0 {
+            recover_bus(&sda, &scl)?;
+        }
+        if scl.rd()? == 0 {
             return Err(Error::Bus(
-                "SDA or SCL stuck low: check module VCC/GND and pull-ups".into(),
+                "SCL stuck low: check module VCC/GND and pull-ups".into(),
+            ));
+        }
+        d(2);
+        if sda.rd()? == 0 {
+            return Err(Error::Bus(
+                "SDA stuck low after bus recovery: check module VCC/GND and pull-ups".into(),
             ));
         }
         Ok(Self { addr, sda, scl })

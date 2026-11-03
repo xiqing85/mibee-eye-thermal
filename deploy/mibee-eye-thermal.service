@@ -1,0 +1,18 @@
+[Unit]
+Description=MiBee Eye thermal camera (MLX90640 -> GB28181/Web)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mibee-eye-thermal serve --config /etc/mibee-eye-thermal/config.toml
+Restart=always
+RestartSec=5
+# Bit-bang needs the TWI2 driver detached from PH2/PH3 before export.
+ExecStartPre=-/bin/sh -c 'echo 5002800.i2c > /sys/bus/platform/drivers/mv64xxx_i2c/unbind 2>/dev/null || true'
+# sysfs GPIO + unbind require root in the bring-up phase.
+User=root
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
