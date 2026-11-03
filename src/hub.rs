@@ -24,7 +24,7 @@ use std::sync::mpsc;
 use crate::ee::{CommonParams, Eeprom};
 use crate::i2c::{bitbang::BitBang, twi::Twi, MlxBus};
 use crate::mlx90640::{AuxReadings, Mlx90640, HEIGHT, PIXELS, WIDTH};
-use crate::render::{render_rgb, rgb_to_i420};
+use crate::render::rgb_to_i420;
 use crate::settings::{BusSpec, StreamConfig};
 
 /// What the currently served thermal frame is made of.
@@ -395,7 +395,9 @@ fn encoder_loop(hub: Arc<ThermalHub>, width: usize, height: usize, fps: f32, bit
             t_synthetic += 1.0 / fps.max(0.1) as f64;
             status = ThermalStatus::synthetic(t_synthetic, status.frame_number);
         }
-        let rgb = render_rgb(&status.to, width, height);
+        // Annotated: the GB28181 stream (NVR recordings/live) carries the
+        // on-image temperature readings, not just pseudo-color.
+        let rgb = crate::render::render_rgb_annotated(&status.to, width, height, None, None);
         let i420 = rgb_to_i420(&rgb, width, height);
 
         if hub.idr_flag.swap(false, Ordering::Relaxed) {
