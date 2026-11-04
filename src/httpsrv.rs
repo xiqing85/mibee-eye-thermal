@@ -45,6 +45,9 @@ pub struct WebCtx {
     /// Front-end asset directory (family webui bundle, `make sync-thermal`).
     pub static_dir: PathBuf,
     pub device_name: String,
+    /// Where PUT /api/hardware/config persists the overlay (sibling
+    /// `hardware.toml` of the config file); None = runtime-only.
+    pub persist_path: Option<PathBuf>,
     sessions: Mutex<HashMap<String, Instant>>,
     boot: Instant,
 }
@@ -57,6 +60,7 @@ impl WebCtx {
         api_token: String,
         static_dir: PathBuf,
         device_name: String,
+        persist_path: Option<PathBuf>,
     ) -> Self {
         Self {
             hub,
@@ -65,6 +69,7 @@ impl WebCtx {
             api_token,
             static_dir,
             device_name,
+            persist_path,
             sessions: Mutex::new(HashMap::new()),
             boot: Instant::now(),
         }
@@ -318,7 +323,7 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<WebCtx>) -> std::io::Result
                 "{{\"ok\":true,\"data\":{{\"spec_version\":\"1\",\
                  \"device\":{{\"name\":\"{}\",\"model\":\"MLX90640 Thermal\",\"vendor\":\"MiBee\"}},\
                  \"auth\":{{\"model\":\"session\",\"setup\":false,\"open\":{}}},\
-                 \"thermal\":{{\"available\":{available},\"radiometric\":{},\"max_fps\":{:.3},\"rules\":0}},\
+                 \"thermal\":{{\"available\":{available},\"radiometric\":{},\"max_fps\":{:.3},\"rules\":0,\"hardware\":true}},\
                  \"events\":[\"thermal.temperature\"]}}}}",
                 ctx.device_name,
                 ctx.open_mode(),
@@ -356,6 +361,142 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<WebCtx>) -> std::io::Result
                 respond(&mut stream, 200, "application/json", body.as_bytes()).await
             }
         },
+
+        // --- hardware bring-up (SPEC §3.7 hardware): pins/address + scan ---
+        ("GET", "/api/hardware") if authorized => {
+            let t = ctx.hub.hardware.target();
+            let scan = ctx.hub.hardware.scan_state();
+            let body = serde_json::json!({
+                "ok": true,
+                "data": {
+                    "bus": serde_json::to_value(&t.bus).unwrap_or(serde_json::Value::Null),
+                    "addr": t.addr,
+                    "persist_path": ctx.persist_path.as_ref().map(|p| p.display().to_string()),
+                    "scan": scan_json(&scan),
+                }
+            });
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                body.to_string().as_bytes(),
+            )
+            .await
+        }
+        ("GET", "/api/hardware/scan") if authorized => {
+            let body =
+                serde_json::json!({"ok": true, "data": scan_json(&ctx.hub.hardware.scan_state())});
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                body.to_string().as_bytes(),
+            )
+            .await
+        }
+        ("POST", "/api/hardware/scan") if authorized => {
+            if ctx.hub.hardware.scan_state().running {
+                return respond(
+                    &mut stream,
+                    409,
+                    "application/json",
+                    br#"{"ok":false,"error":"scan already running"}"#,
+                )
+                .await;
+            }
+            // Optional body {"gpio_candidates":[[sda,scl],...]} — default
+            // is the classic Orange Pi Zero 3 PH2/PH3 pair.
+            let mut cands: Vec<(u32, u32)> = vec![(226, 227)];
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(list) = v.get("gpio_candidates").and_then(|c| c.as_array()) {
+                    let parsed: Vec<(u32, u32)> = list
+                        .iter()
+                        .filter_map(|p| {
+                            let a = p.as_array()?;
+                            Some((a.first()?.as_u64()? as u32, a.get(1)?.as_u64()? as u32))
+                        })
+                        .collect();
+                    if !parsed.is_empty() {
+                        cands = parsed;
+                    }
+                }
+            }
+            let hw = ctx.hub.hardware.clone();
+            let _ = std::thread::Builder::new()
+                .name("hw-scan".into())
+                .spawn(move || hw.run_scan(&cands));
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                br#"{"ok":true,"data":{"running":true}}"#,
+            )
+            .await
+        }
+        ("PUT", "/api/hardware/config") if authorized => {
+            #[derive(serde::Deserialize)]
+            struct HardwarePut {
+                bus: crate::settings::BusSpec,
+                addr: u8,
+            }
+            let put: HardwarePut = match serde_json::from_str(&body) {
+                Ok(p) => p,
+                Err(e) => {
+                    let m = format!("{{\"ok\":false,\"error\":\"bad config: {e}\"}}");
+                    return respond(&mut stream, 400, "application/json", m.as_bytes()).await;
+                }
+            };
+            if !crate::scan::ADDR_RANGE.contains(&put.addr) {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"addr must be 0x30..=0x3E (MLX90640 strapping window)"}"#,
+                )
+                .await;
+            }
+            if let crate::settings::BusSpec::Gpio { sda, scl } = &put.bus {
+                if sda == scl || *sda == 0 || *scl == 0 {
+                    return respond(
+                        &mut stream,
+                        400,
+                        "application/json",
+                        br#"{"ok":false,"error":"gpio sda/scl must be distinct non-zero pins"}"#,
+                    )
+                    .await;
+                }
+            }
+            ctx.hub.hardware.set_target(crate::hub::SensorTarget {
+                bus: put.bus.clone(),
+                addr: put.addr,
+            });
+            // Persist for reboot (best-effort — runtime apply already done).
+            let (persisted, persist_error) = match &ctx.persist_path {
+                None => (false, Some("persistence disabled".into())),
+                Some(path) => {
+                    match std::fs::write(path, crate::settings::overlay_toml(&put.bus, put.addr)) {
+                        Ok(()) => (true, None),
+                        Err(e) => (false, Some(format!("{e}"))),
+                    }
+                }
+            };
+            let body = serde_json::json!({
+                "ok": true,
+                "data": {
+                    "bus": serde_json::to_value(&put.bus).unwrap_or(serde_json::Value::Null),
+                    "addr": put.addr,
+                    "persisted": persisted,
+                    "persist_error": persist_error,
+                }
+            });
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                body.to_string().as_bytes(),
+            )
+            .await
+        }
 
         // --- bring-up debug ---
         ("GET", "/api/debug/alarm-test") if authorized => {
@@ -418,6 +559,24 @@ async fn sse_loop(stream: &mut TcpStream, ctx: &WebCtx) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// ScanState → SPEC §3.7 hardware JSON (hits carry their paste-ready
+/// config snippet so the UI never re-implements formatting).
+fn scan_json(st: &crate::hub::ScanState) -> serde_json::Value {
+    serde_json::json!({
+        "running": st.running,
+        "started_ms": st.started_ms,
+        "finished_ms": st.finished_ms,
+        "hits": st.hits.iter().map(|h| serde_json::json!({
+            "bus": h.bus,
+            "addr": h.addr,
+            "id": h.id,
+            "config": crate::scan::config_snippet(h),
+        })).collect::<Vec<_>>(),
+        "pair_errors": st.pair_errors,
+        "error": st.error,
+    })
 }
 
 /// §6 `thermal.temperature` payload (same fields as /api/thermal/current

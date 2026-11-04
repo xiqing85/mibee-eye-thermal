@@ -3,12 +3,15 @@
 //! need this; only `serve` does.
 
 use gb28181_rs::config::Gb28181Config;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum BusSpec {
-    Twi(String),
+    /// Hardware TWI bus device (`bus = { type = "twi", device = "/dev/i2c-2" }`).
+    Twi {
+        device: String,
+    },
     Gpio {
         sda: u32,
         scl: u32,
@@ -156,6 +159,43 @@ impl Settings {
     }
 }
 
+/// One `hardware.toml` overlay line set — the `[sensor]` table the web
+/// hardware API persists across reboots.
+pub fn overlay_toml(bus: &BusSpec, addr: u8) -> String {
+    format!(
+        "# mibee-eye-thermal hardware overlay -- written by PUT /api/hardware/config\n\
+         [sensor]\n{}\naddr = {:#04x}\n",
+        bus_toml(bus),
+        addr
+    )
+}
+
+/// Inline TOML value for a bus spec (same shape the scan config snippet
+/// prints, so paste-ready configs and the overlay can never drift).
+pub fn bus_toml(bus: &BusSpec) -> String {
+    match bus {
+        BusSpec::Twi { device } => format!("bus = {{ type = \"twi\", device = \"{device}\" }}"),
+        BusSpec::Gpio { sda, scl } => {
+            format!("bus = {{ type = \"gpio\", sda = {sda}, scl = {scl} }}")
+        }
+        BusSpec::Auto => "bus = { type = \"auto\" }".to_string(),
+    }
+}
+
+/// Parse a `hardware.toml` overlay (the `[sensor]` table the web hardware
+/// API writes). The wrapper matters: the fields live *under* `[sensor]`,
+/// and parsing straight into `SensorConfig` would silently swallow the
+/// table and fall back to defaults.
+pub fn parse_overlay(text: &str) -> Result<SensorConfig, String> {
+    #[derive(Deserialize)]
+    struct File {
+        sensor: SensorConfig,
+    }
+    toml::from_str::<File>(text)
+        .map(|f| f.sensor)
+        .map_err(|e| format!("overlay parse: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +208,49 @@ mod tests {
         assert_eq!(s.stream.fps, 2.0);
         assert!(!s.gb28181.enabled);
         assert!(matches!(s.sensor.bus, BusSpec::Gpio { sda: 226, scl: 227 }));
+    }
+
+    #[test]
+    fn bus_spec_forms_parse() {
+        // The struct-variant forms must parse from the documented TOML shape.
+        let s = Settings::load_toml(
+            "[sensor]\nbus = { type = \"twi\", device = \"/dev/i2c-2\" }\naddr = 48\n",
+        )
+        .expect("twi form");
+        assert_eq!(
+            s.sensor.bus,
+            BusSpec::Twi {
+                device: "/dev/i2c-2".into()
+            }
+        );
+        assert_eq!(s.sensor.addr, 48);
+        let s = Settings::load_toml("[sensor]\nbus = { type = \"auto\" }\n").expect("auto form");
+        assert_eq!(s.sensor.bus, BusSpec::Auto);
+    }
+
+    #[test]
+    fn overlay_toml_roundtrips_through_sensor_config() {
+        // Non-default addr everywhere: a silent fall-back to defaults
+        // (fields not read from under [sensor]) must fail loudly.
+        let toml_text = overlay_toml(&BusSpec::Gpio { sda: 8, scl: 10 }, 0x36);
+        let s = parse_overlay(&toml_text).expect("overlay parses");
+        assert_eq!(s.bus, BusSpec::Gpio { sda: 8, scl: 10 });
+        assert_eq!(s.addr, 0x36);
+        let toml_text = overlay_toml(
+            &BusSpec::Twi {
+                device: "/dev/i2c-2".into(),
+            },
+            0x30,
+        );
+        assert!(toml_text.contains("device = \"/dev/i2c-2\""));
+        let s = parse_overlay(&toml_text).expect("overlay parses");
+        assert_eq!(
+            s.bus,
+            BusSpec::Twi {
+                device: "/dev/i2c-2".into()
+            }
+        );
+        assert_eq!(s.addr, 0x30);
     }
 
     #[test]

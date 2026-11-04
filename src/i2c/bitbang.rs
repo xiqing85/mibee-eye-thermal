@@ -132,6 +132,12 @@ impl BitBang {
         Ok(Self { addr, sda, scl })
     }
 
+    /// Retarget the probe address without re-opening the bus — `scan` walks
+    /// 0x30..=0x3E on one exported pair instead of exporting per address.
+    pub fn set_addr(&mut self, addr: u8) {
+        self.addr = addr;
+    }
+
     fn start(&mut self) -> Result<()> {
         self.sda.rz()?;
         self.scl.rz()?;
