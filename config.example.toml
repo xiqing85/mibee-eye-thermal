@@ -6,7 +6,7 @@
 
 [sensor]
 # Bus spec: gpio:SDA,SCL (sysfs bit-bang, works with weak on-board pull-ups),
-# twi:"/dev/i2c-N" (hardware TWI — needs proper pull-ups) or "auto"
+# twi device (hardware TWI — needs proper pull-ups) or "auto"; see docs/porting.md
 # (boot-time discovery: TWI first, bit-bang fallback). Run `scan` on a new
 # board/module to find the working combination (docs/porting.md).
 bus = { type = "gpio", sda = 226, scl = 227 }
