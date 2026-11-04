@@ -175,21 +175,20 @@ pub fn auto_detect() -> Option<(Hit, bool)> {
 
 /// Format a scan result as ready-to-paste config lines.
 pub fn config_snippet(hit: &Hit) -> String {
+    let bus = if let Some(dev) = hit.bus.strip_prefix("twi:") {
+        crate::settings::BusSpec::Twi {
+            device: dev.to_string(),
+        }
+    } else {
+        let pins = hit.bus.trim_start_matches("gpio:");
+        let (sda, scl) = pins.split_once(',').unwrap_or((pins, pins));
+        let (sda, scl) = (sda.parse().unwrap_or(0), scl.parse().unwrap_or(0));
+        crate::settings::BusSpec::Gpio { sda, scl }
+    };
     format!(
-        "[sensor]\nbus = {{ type = \"{}\", {} }}\naddr = {:#04x}\n",
-        if hit.bus.starts_with("twi:") {
-            "twi"
-        } else {
-            "gpio"
-        },
-        if hit.bus.starts_with("twi:") {
-            format!("\"{}\"", hit.bus.trim_start_matches("twi:"))
-        } else {
-            let pins = hit.bus.trim_start_matches("gpio:");
-            let (sda, scl) = pins.split_once(',').unwrap_or((pins, pins));
-            format!("sda = {sda}, scl = {scl}")
-        },
-        hit.addr,
+        "[sensor]\n{}\naddr = {:#04x}\n",
+        crate::settings::bus_toml(&bus),
+        hit.addr
     )
 }
 
@@ -213,7 +212,7 @@ mod tests {
             addr: 0x33,
             id: 0x1901,
         };
-        assert!(config_snippet(&twi).contains("bus = { type = \"twi\", \"/dev/i2c-2\" }"));
+        assert!(config_snippet(&twi).contains("bus = { type = \"twi\", device = \"/dev/i2c-2\" }"));
         assert!(config_snippet(&twi).contains("addr = 0x33"));
         let gpio = Hit {
             bus: "gpio:226,227".into(),

@@ -25,6 +25,7 @@ use crate::ee::{CommonParams, Eeprom};
 use crate::i2c::{bitbang::BitBang, twi::Twi, MlxBus};
 use crate::mlx90640::{AuxReadings, Mlx90640, HEIGHT, PIXELS, WIDTH};
 use crate::render::rgb_to_i420;
+use crate::scan::Hit;
 use crate::settings::{BusSpec, StreamConfig};
 
 /// What the currently served thermal frame is made of.
@@ -84,6 +85,123 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Runtime sensor target (bus + address), hot-reconfigured by the web
+/// hardware API and re-read by the sensor loop every pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensorTarget {
+    pub bus: BusSpec,
+    pub addr: u8,
+}
+
+/// One scan run's outcome (hits + why unusable pairs failed).
+#[derive(Debug, Default, Clone)]
+pub struct ScanState {
+    pub running: bool,
+    pub started_ms: u64,
+    pub finished_ms: Option<u64>,
+    pub hits: Vec<Hit>,
+    pub pair_errors: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Shared control block for the hardware API: the live sensor target, the
+/// bus ownership handshake with the sensor loop, and the last scan result.
+///
+/// Bus ownership is one mutex: the sensor loop holds `pass` for the
+/// duration of a read pass, a scan run acquires it for the duration of the
+/// probe sweep. Whoever holds it owns the pins — no flag races. While a
+/// scan holds the bus the loop idles (the encoder keeps streaming the last
+/// frame, so the GB28181 feed pauses instead of corrupting).
+pub struct HardwareCtl {
+    target: RwLock<SensorTarget>,
+    pass: Mutex<()>,
+    scan: Mutex<ScanState>,
+}
+
+impl HardwareCtl {
+    fn new(bus: BusSpec, addr: u8) -> Self {
+        Self {
+            target: RwLock::new(SensorTarget { bus, addr }),
+            pass: Mutex::new(()),
+            scan: Mutex::new(ScanState::default()),
+        }
+    }
+
+    pub fn target(&self) -> SensorTarget {
+        self.target.read().expect("hw target lock").clone()
+    }
+
+    pub fn set_target(&self, t: SensorTarget) {
+        *self.target.write().expect("hw target lock") = t;
+    }
+
+    pub fn scan_state(&self) -> ScanState {
+        self.scan.lock().expect("scan lock").clone()
+    }
+
+    /// Run one discovery sweep on the calling thread. Returns false (and
+    /// does nothing) when a scan is already running. Blocks until the
+    /// sensor loop releases the bus — up to one bit-bang pass, ~40 s.
+    pub fn run_scan(&self, gpio_candidates: &[(u32, u32)]) -> bool {
+        {
+            let mut st = self.scan.lock().expect("scan lock");
+            if st.running {
+                return false;
+            }
+            *st = ScanState {
+                running: true,
+                started_ms: now_ms(),
+                ..ScanState::default()
+            };
+        }
+        let (hits, pair_errors, error) = self.scan_sweep(gpio_candidates);
+        let mut st = self.scan.lock().expect("scan lock");
+        st.running = false;
+        st.finished_ms = Some(now_ms());
+        st.hits = hits;
+        st.pair_errors = pair_errors;
+        st.error = error;
+        true
+    }
+
+    fn scan_sweep(
+        &self,
+        gpio_candidates: &[(u32, u32)],
+    ) -> (Vec<Hit>, Vec<String>, Option<String>) {
+        // Acquire bus ownership; a bit-bang frame pass holds it for ~40 s.
+        let sweep_started = Instant::now();
+        let _bus = loop {
+            match self.pass.try_lock() {
+                Ok(g) => break g,
+                Err(_) if sweep_started.elapsed() < Duration::from_secs(90) => {
+                    thread::sleep(Duration::from_millis(150))
+                }
+                Err(_) => {
+                    return (
+                        Vec::new(),
+                        Vec::new(),
+                        Some("sensor loop did not release the bus within 90s".into()),
+                    )
+                }
+            }
+        };
+        // Hardware TWI first; GPIO pairs only when no TWI hit — a working
+        // hardware bus beats bit-bang, and GPIO probing unbinds TWI2.
+        let mut hits = crate::scan::scan_twi();
+        let mut pair_errors = Vec::new();
+        if hits.is_empty() {
+            for &(sda, scl) in gpio_candidates {
+                let (found, err) = crate::scan::scan_gpio_pair(sda, scl);
+                if let Some(e) = err {
+                    pair_errors.push(e);
+                }
+                hits.extend(found);
+            }
+        }
+        (hits, pair_errors, None)
+    }
+}
+
 /// gb28181-rs live-frame source over a bounded fan-out registry.
 pub struct ThermalHub {
     subs: Arc<Mutex<HashMap<u64, mpsc::SyncSender<AccessUnit>>>>,
@@ -93,6 +211,8 @@ pub struct ThermalHub {
     idr_flag: Arc<AtomicBool>,
     /// Diagnostics for /healthz.
     pub encoded_frames: Arc<AtomicU64>,
+    /// Runtime hardware config + scan control (web hardware API).
+    pub hardware: Arc<HardwareCtl>,
 }
 
 impl ThermalHub {
@@ -120,16 +240,18 @@ impl ThermalHub {
             status: Arc::new(RwLock::new(ThermalStatus::synthetic(0.0, 0))),
             idr_flag: Arc::new(AtomicBool::new(true)),
             encoded_frames: Arc::new(AtomicU64::new(0)),
+            hardware: Arc::new(HardwareCtl::new(bus.clone(), addr)),
         });
 
         // Sensor thread — real frames replace the synthetic placeholder.
+        // Bus/address come from the shared hardware target (re-read every
+        // pass so the web hardware API can reconfigure pins live).
         {
             let hub = Arc::clone(&hub);
-            let bus = bus.clone();
             let emissivity = cfg.emissivity;
             thread::Builder::new()
                 .name("mlx-sensor".into())
-                .spawn(move || sensor_loop(hub, bus, addr, emissivity))
+                .spawn(move || sensor_loop(hub, emissivity))
                 .expect("spawn sensor thread");
         }
 
@@ -194,7 +316,7 @@ impl MlxBus for AnyBus {
 
 fn open_bus(spec: &BusSpec, addr: u8) -> crate::Result<AnyBus> {
     match spec {
-        BusSpec::Twi(dev) => Ok(AnyBus::Twi(Twi::open(dev, addr)?)),
+        BusSpec::Twi { device } => Ok(AnyBus::Twi(Twi::open(device, addr)?)),
         BusSpec::Gpio { sda, scl } => {
             crate::scan::release_gpio_pair(*sda, *scl);
             Ok(AnyBus::Gpio(BitBang::new(*sda, *scl, addr)?))
@@ -205,8 +327,8 @@ fn open_bus(spec: &BusSpec, addr: u8) -> crate::Result<AnyBus> {
             // answered at it); the configured `addr` is ignored on this path.
             match crate::scan::auto_detect() {
                 Some((hit, false)) => {
-                    let dev = hit.bus.trim_start_matches("twi:").to_string();
-                    Ok(AnyBus::Twi(Twi::open(&dev, hit.addr)?))
+                    let device = hit.bus.trim_start_matches("twi:").to_string();
+                    Ok(AnyBus::Twi(Twi::open(&device, hit.addr)?))
                 }
                 Some((hit, true)) => {
                     let pins = hit.bus.trim_start_matches("gpio:");
@@ -232,14 +354,32 @@ fn open_bus(spec: &BusSpec, addr: u8) -> crate::Result<AnyBus> {
     }
 }
 
-fn sensor_loop(hub: Arc<ThermalHub>, bus: BusSpec, addr: u8, emissivity: f64) {
+fn sensor_loop(hub: Arc<ThermalHub>, emissivity: f64) {
     // First synthetic frame already in place; keep producing real ones.
     let mut eeprom: Option<Eeprom> = None;
     let mut failures = 0u32;
+    let mut last_target = hub.hardware.target();
     while !hub.stop.load(Ordering::Relaxed) {
+        // Bus ownership: a scan sweep holds the pass lock — idle until it
+        // is done instead of fighting it over the pins.
+        let _pass_guard = match hub.hardware.pass.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
         let started = Instant::now();
+        // Live target: the web hardware API may have re-pointed the pins
+        // (or swapped the sensor module) since the last pass.
+        let target = hub.hardware.target();
+        if target != last_target {
+            eeprom = None; // different sensor → calibration block is stale
+            last_target = target.clone();
+            eprintln!("sensor: target changed to {:?} (re-reading EEPROM)", target);
+        }
         let pass = (|| -> Option<([f32; PIXELS], CommonParams)> {
-            let bus = match open_bus(&bus, addr) {
+            let bus = match open_bus(&target.bus, target.addr) {
                 Ok(b) => b,
                 Err(e) => {
                     hub.status.write().expect("status lock").last_sensor_error =
@@ -297,6 +437,9 @@ fn sensor_loop(hub: Arc<ThermalHub>, bus: BusSpec, addr: u8, emissivity: f64) {
                 );
             }
         }
+        // Bus released with the pass guard — yield ownership before the
+        // backoff sleep so a scan can slip in between passes.
+        drop(_pass_guard);
         // Bit-bang pass itself takes tens of seconds; don't hammer the bus
         // on failure either. Hardware TWI lands with the pull-up fix.
         let backoff = if failures == 0 {
@@ -448,6 +591,35 @@ mod tests {
     }
 
     #[test]
+    fn scan_state_machine_transitions() {
+        // No sensor loop is running on the test host: the pass lock is
+        // free, the sweep runs immediately and the state settles with
+        // finished set. Hits/pair errors depend on the host's I2C/GPIO —
+        // only the bookkeeping is asserted.
+        let hw = HardwareCtl::new(BusSpec::Auto, 0x33);
+        assert!(!hw.scan_state().running);
+        assert!(hw.run_scan(&[(226, 227)]));
+        let st = hw.scan_state();
+        assert!(!st.running);
+        assert!(st.finished_ms.is_some());
+        assert!(st.started_ms > 0);
+        assert!(st.error.is_none());
+        // Target swap is visible immediately (the sensor loop re-reads it
+        // every pass) and resets nothing here.
+        hw.set_target(SensorTarget {
+            bus: BusSpec::Gpio { sda: 8, scl: 10 },
+            addr: 0x30,
+        });
+        assert_eq!(
+            hw.target(),
+            SensorTarget {
+                bus: BusSpec::Gpio { sda: 8, scl: 10 },
+                addr: 0x30
+            }
+        );
+    }
+
+    #[test]
     fn subscribe_unsubscribe_bookkeeping() {
         let hub = ThermalHub {
             subs: Arc::new(Mutex::new(HashMap::new())),
@@ -456,6 +628,7 @@ mod tests {
             status: Arc::new(RwLock::new(ThermalStatus::synthetic(0.0, 0))),
             idr_flag: Arc::new(AtomicBool::new(false)),
             encoded_frames: Arc::new(AtomicU64::new(0)),
+            hardware: Arc::new(HardwareCtl::new(BusSpec::Auto, 0x33)),
         };
         let sub = <ThermalHub as FrameSource>::subscribe_with_capacity(&hub, 2);
         assert!(hub.idr_flag.load(Ordering::Relaxed));

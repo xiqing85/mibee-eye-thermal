@@ -25,6 +25,20 @@ bus = { type = "gpio", sda = 226, scl = 227 }
 addr = 0x33
 ```
 
+## Web 端配置与扫描
+
+同一套能力也长在 HTTP API 上（family 信封、需登录/Bearer）——`docs` 之外
+的运维不需要 SSH：
+
+- `GET /api/hardware` — 当前总线/地址 + 上次扫描结果
+- `POST /api/hardware/scan` — 触发一次扫描（后台任务；可选 body
+  `{"gpio_candidates":[[sda,scl],...]}`）；`GET /api/hardware/scan` 轮询结果
+- `PUT /api/hardware/config` — 改总线/地址（立即生效 + 写
+  `hardware.toml` 覆盖文件，重启不丢）
+
+扫描期间传感器循环让出总线（GB28181 画面停在最后一帧，扫描完自动恢复）；
+webui 前端有「硬件接入」卡片（能力键 `thermal.hardware`）可视化以上操作。
+
 也可以让服务开机自探测（硬件 TWI 优先，位模拟兜底）：
 
 ```toml

@@ -237,8 +237,28 @@ fn run_serve(config_path: Option<String>) -> Result<()> {
     let path = config_path.unwrap_or_else(|| "config.toml".into());
     let text = std::fs::read_to_string(&path)
         .map_err(|e| error::Error::Usage(format!("cannot read config {path}: {e}")))?;
-    let cfg = settings::Settings::load_toml(&text)
+    let mut cfg = settings::Settings::load_toml(&text)
         .map_err(|e| error::Error::Usage(format!("{path}: {e}")))?;
+
+    // Hardware overlay (written by PUT /api/hardware/config) overrides the
+    // [sensor] table: pins/address discovered via the web scan survive
+    // reboots without editing config.toml.
+    let persist_path = std::path::Path::new(&path).with_file_name("hardware.toml");
+    if let Ok(overlay) = std::fs::read_to_string(&persist_path) {
+        match settings::parse_overlay(&overlay) {
+            Ok(sensor) => {
+                eprintln!(
+                    "hardware overlay applied: {} (bus pins/address from web config)",
+                    persist_path.display()
+                );
+                cfg.sensor = sensor;
+            }
+            Err(e) => eprintln!(
+                "warning: ignoring bad hardware overlay {}: {e}",
+                persist_path.display()
+            ),
+        }
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -253,7 +273,7 @@ fn run_serve(config_path: Option<String>) -> Result<()> {
             cfg.stream.height,
             cfg.stream.fps,
             match &cfg.sensor.bus {
-                settings::BusSpec::Twi(dev) => dev.clone(),
+                settings::BusSpec::Twi { device } => device.clone(),
                 settings::BusSpec::Gpio { sda, scl } => format!("gpio:{sda},{scl}"),
                 settings::BusSpec::Auto => "auto".into(),
             }
@@ -288,6 +308,7 @@ fn run_serve(config_path: Option<String>) -> Result<()> {
                 cfg.http.api_token.clone(),
                 std::path::PathBuf::from(&cfg.http.static_dir),
                 cfg.gb28181.effective_device_name(),
+                Some(persist_path.clone()),
             ));
             Some(tokio::spawn(async move {
                 if let Err(e) = httpsrv::serve(ctx, cfg.http.port).await {
